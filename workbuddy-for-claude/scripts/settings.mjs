@@ -14,7 +14,7 @@
 
 import { copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { dirname, join, resolve } from 'node:path'
+import { delimiter, dirname, join, resolve } from 'node:path'
 
 const HOME = join(homedir(), '.workbuddy-claude')
 const CONFIG_PATH = join(HOME, 'config.json')
@@ -23,6 +23,18 @@ const MARKER_PATH = join(HOME, 'installed.json')
 /** Claude Code 读取的上下文窗口上限：模型标称 1000k，留一截给工具输出和压缩余量。 */
 const AUTO_COMPACT_WINDOW = '800000'
 
+/**
+ * 常驻界面模组所在的目录。
+ *
+ * 放在会话专属的 dev-mods 里只有当前会话能看到；写进这个环境变量后，
+ * 每个新会话（包括桌面 App 启的）都会按 `--plugin-dir` 的方式加载它们。
+ */
+const MODS_ROOT = join(homedir(), '.claude', 'wb-mods')
+const MOD_PLUGIN_DIRS = [
+  join(MODS_ROOT, 'wb-credits'),
+  join(MODS_ROOT, 'ds-credits'),
+].join(delimiter)
+
 /** 本程序会写入的全部环境变量名。 */
 const ENV_KEYS = [
   'ANTHROPIC_BASE_URL',
@@ -30,6 +42,7 @@ const ENV_KEYS = [
   'ANTHROPIC_MODEL',
   'ANTHROPIC_SMALL_FAST_MODEL',
   'CLAUDE_CODE_AUTO_COMPACT_WINDOW',
+  'CLAUDE_CODE_PLUGIN_DIRS',
 ]
 
 /** 读 JSON 文件；不存在或损坏时返回 null。 */
@@ -73,6 +86,8 @@ function desiredEnv(config) {
     ANTHROPIC_MODEL: config.defaultModel,
     ANTHROPIC_SMALL_FAST_MODEL: config.smallModel || config.defaultModel,
     CLAUDE_CODE_AUTO_COMPACT_WINDOW: AUTO_COMPACT_WINDOW,
+    // 只有这些模组真的装在这台机器上时才写，避免影响别人。
+    ...existsSync(MODS_ROOT) ? { CLAUDE_CODE_PLUGIN_DIRS: MOD_PLUGIN_DIRS } : {},
   }
 }
 

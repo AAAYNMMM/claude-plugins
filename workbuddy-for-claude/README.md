@@ -209,6 +209,14 @@ node dist/server.js status
 node dist/server.js deepseek-balance
 ```
 
+### 界面模组（可选）
+
+桌面版底部状态栏的两行读数由两个模组提供：`wb-credits`（WorkBuddy 积分）与
+`ds-credits`（DeepSeek 余额）。它们装在 `~/.claude/wb-mods/`，安装脚本把这个目录写进
+`CLAUDE_CODE_PLUGIN_DIRS`，于是**每个新会话**都会加载。
+
+> 为什么不能放在 `~/.claude/dev-mods/<会话id>/`：那个目录属于单个会话，换个对话就看不到了。
+
 ---
 
 ## 停用 / 启用 / 卸载
