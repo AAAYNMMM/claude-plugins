@@ -15,11 +15,6 @@
       "description": "把本机已登录的 WorkBuddy 模型接入 Claude Code，并与 DeepSeek 放在同一个模型列表里无缝切换。"
     },
     {
-      "name": "unrestricted",
-      "source": "./unrestricted",
-      "description": "通过 prompt.context 向会话注入回答风格与交付约定，统一回复的尺度、结构和表达方式。"
-    },
-    {
       "name": "ds-credits",
       "source": "./ds-credits",
       "description": "在桌面版底部状态栏显示 DeepSeek 余额（读取 claude-workbuddy 网关写入的余额文件，不接触 API Key）。"
