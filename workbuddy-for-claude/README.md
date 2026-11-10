@@ -67,6 +67,9 @@ DeepSeek 的 Anthropic 兼容端点**按模型名前缀**选择上游模型并�
 "claude-opus-5.5":   { "provider": "deepseek", "label": "DeepSeek · V4 Pro" }
 ```
 
+列表顺序就是 `routes` 的键顺序：`routes.mjs sync` 会把 DeepSeek 路由统一提到最前，
+其余保持目录顺序；`deepseek-route.mjs set` 新增的条目落在现有 DeepSeek 条目之后。
+
 用脚本改（会顺手同步到 App 并重启网关）：
 
 ```bash

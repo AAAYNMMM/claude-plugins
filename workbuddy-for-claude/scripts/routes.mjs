@@ -115,11 +115,26 @@ for (const route of Object.values(routes)) {
   route.label = `WB · ${model.id}${multiplier}`
 }
 
-config.routes = routes
+/**
+ * 把 DeepSeek 路由排到最前面，其余保持原顺序。
+ *
+ * 桌面 App 的模型列表就是这个对象的键顺序，所以“DeepSeek 排在第几”由这里决定。
+ * DeepSeek 内部也保持既有顺序（先 Flash 后 Pro），不会因为同步而互换。
+ */
+function withDeepSeekFirst(entries) {
+  const list = Object.entries(entries)
+  return Object.fromEntries([
+    ...list.filter(([, route]) => route.provider === 'deepseek'),
+    ...list.filter(([, route]) => route.provider !== 'deepseek'),
+  ])
+}
+
+config.routes = withDeepSeekFirst(routes)
 writeFileSync(CONFIG_PATH, `${JSON.stringify(config, null, 2)}\n`)
 
 const workbuddy = Object.values(routes).filter(route => route.provider === 'workbuddy').length
-process.stdout.write(`synced ${workbuddy} WorkBuddy models + 1 DeepSeek route into ${CONFIG_PATH}\n`)
+const deepseek = Object.values(routes).filter(route => route.provider === 'deepseek').length
+process.stdout.write(`synced ${workbuddy} WorkBuddy models + ${deepseek} DeepSeek route(s) into ${CONFIG_PATH}\n`)
 for (const [alias, route] of Object.entries(routes)) {
   process.stdout.write(`  ${alias}\t${route.label ?? route.model ?? ''}\n`)
 }

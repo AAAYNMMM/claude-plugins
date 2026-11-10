@@ -85,6 +85,14 @@ if (command === 'set') {
   process.exit(1)
 }
 
+// DeepSeek 路由统一放在最前面：App 的模型列表就是这个对象的键顺序。
+// 新增的条目落在现有 DeepSeek 条目之后，所以“Flash、V4 Pro、其余”这个顺序保持不变。
+const ordered = Object.entries(config.routes)
+config.routes = Object.fromEntries([
+  ...ordered.filter(([, route]) => route.provider === 'deepseek'),
+  ...ordered.filter(([, route]) => route.provider !== 'deepseek'),
+])
+
 writeFileSync(CONFIG_PATH, `${JSON.stringify(config, null, 2)}\n`)
 
 if (!argv.includes('--apply')) {
