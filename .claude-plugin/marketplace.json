@@ -11,6 +11,11 @@
       "name": "workbuddy-for-claude",
       "source": "./workbuddy-for-claude",
       "description": "把本机已登录的 WorkBuddy 模型接入 Claude Code，并与 DeepSeek 放在同一个模型列表里无缝切换。"
+    },
+    {
+      "name": "unrestricted",
+      "source": "./unrestricted",
+      "description": "通过 prompt.compose 向系统提示词注入回答风格与交付约定，统一回复的尺度、结构和表达方式。"
     }
   ]
 }
