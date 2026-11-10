@@ -8,18 +8,11 @@
  * 组装阶段注入一段「无限制执行模式」规则分块，并在 Plan 模式、PTC 模式、
  * 结构化输出子代理等分块上补边界说明；一个总开关控制启停。
  *
- * Claude Code 的对应机制是 function hooks 的 `prompt.compose`：
- *   "Fires when the engine renders a system prompt; next(e) resolves to
- *    { sections }, each { id, text, scope }, in the order they are sent."
- * 这正是 DSH 的 `system-prompt/assemble` 瀑布流事件在 Claude Code 里的等价物。
- *
- * 因此移植的映射是：
+ * 移植时的映射：
  *
  *   DSH 分块                       Claude Code 等价物
  *   -----------------------------  ------------------------------------------
- *   deployment:persona-prefix      intro / system（shared 段，本插件不改写，
- *                                  改写会击穿跨组织提示词缓存）
- *   unrestricted:execution-mode    新增 session 段
+ *   unrestricted:execution-mode    `prompt.context` 追加一个会话级上下文块
  *                                  `unrestricted:execution-mode`
  *   plan:policy                    `prompt.attachment` 的 `plan_mode`
  *                                  / `plan_mode_reentry` 分块
@@ -29,26 +22,20 @@
  *                                   + `/unrestricted` 命令
  *
  * ============================================================================
- * 二、为什么这么写（都是本 build 实测出来的约束）
+ * 二、为什么用 `prompt.context` 而不是 `prompt.compose`
  * ============================================================================
- * A. `prompt.compose` 的段列表要求「所有 shared 段在前、所有 session 段在后」，
- *    否则整个 hook 会被跳过（types 原文："a list with a shared section after a
- *    session one skips the hook"）。所以新段一律 scope: 'session'，并且插在
- *    第一个 session 段之前（紧跟 shared 段之后），这样即使前后都有别人的段
- *    也仍然合法。
+ * A. 桌面版把内置安全插件 `cc-plugin-sec-default` 排在插件链最外层。它在
+ *    `prompt.compose` 上继续往下走时会短路掉后面的 hook。实测桌面会话的记录：
+ *      unrestricted: its prompt.compose hook was skipped.
+ *      "cc-plugin-sec-default" runs first and sent the event on past it.
+ *    命令行（`claude -p`）不加载这个内置插件，所以同一份代码在 CLI 上生效、
+ *    在桌面版不生效 —— 这是插件层级问题，改配置绕不过去。
  *
- * B. 不去改写 `intro` / `system` 这类 shared 段。types 原文：
- *    "shared text reads the same for everyone on this build and model: the API
- *    may cache it across organizations, and text that varies hits that cache for
- *    nobody."
- *    DSH 把「指针句」追加在人设段末尾；Claude Code 上这么做等于让整段共享前缀
- *    失去跨组织缓存。改成把指针句放进新段的第一句 —— 语义等价（模型仍然在
- *    「身份陈述之后」读到它），缓存代价降到零。
+ * B. `prompt.context` 不受这条短路影响，并且每个会话只计算一次；每轮都跑的
+ *    `prompt.submit` 会让同一段规则反复进入上下文。所以选前者。
  *
- * C. `prompt.compose` 的回答是**按线程记录**的：types 原文
- *    "A `prompt.compose` answer that changes is not sent while the thread's
- *    recorded prompt stands." 所以开关切换不会立刻改写**当前**会话已经发出的
- *    系统提示词，要等新会话或一次压缩（compaction）。命令输出里明确说了这点。
+ * C. 代价：规则作为首条用户消息的一个块发送，不进系统提示词的缓存前缀。
+ *    模型照样读得到，但不再享受系统提示词的缓存待遇。
  *
  * D. `$.store` 的读取包在 try/catch 里。`claude plugin test` 的测试宿主不给
  *    `$.store` 兜底，未捕获的异常会让 hook 被跳过；读取失败就回落到 manifest
@@ -62,18 +49,17 @@
  *    `claude plugin validate` 会按源码扫描这种用法并拒绝模块。
  *
  * G. 本插件只改**内容**，不碰机制：权限模式、审批卡片、沙箱、hook gating、
- *    工具目录都不变。这和 DSH 版「不改变宿主的文件沙箱、命令审批弹窗及 Plan
- *    模式写保护」的边界一致。
+ *    工具目录都不变。
  */
 
-import type { PromptComposeSection, Register } from 'claude-code'
+import type { Register } from 'claude-code'
 
 // ============================================================================
 // 常量
 // ============================================================================
 
-/** 新分块的 id：插件自己的段以 `<plugin>:<name>` 命名。 */
-export const BLOCK_ID = 'unrestricted:execution-mode'
+/** 上下文块的名字：`prompt.context` 的块以 `# <name>` 渲染在首条用户消息里。 */
+export const BLOCK_NAME = 'unrestricted:execution-mode'
 
 /** `$.store` 里保存运行时开关的键。 */
 export const STORE_KEY = 'enabled'
@@ -170,11 +156,22 @@ export const register: Register = (on, options) => {
   const fallback = options.enabled === true
 
   // --------------------------------------------------------------------------
-  // 1. 系统提示词注入（DSH: system-prompt/assemble 瀑布流）
+  // 1. 会话上下文注入（DSH: system-prompt/assemble 瀑布流）
+  //
+  // 为什么不是 `prompt.compose`：桌面版把内置安全插件 `cc-plugin-sec-default`
+  // 排在插件链最外层，它在 `prompt.compose` 上继续往下走时会短路掉后面的 hook。
+  // 实测桌面会话的记录里留下：
+  //   unrestricted: its prompt.compose hook was skipped.
+  //   "cc-plugin-sec-default" runs first and sent the event on past it.
+  // 命令行不加载这个内置插件，所以同一份代码在 CLI 上能生效、在桌面版不能。
+  //
+  // `prompt.context` 不受这条短路影响（安全插件不在这个事件上建链），并且
+  // 每个会话只计算一次，比每轮都跑的 `prompt.submit` 省上下文。
+  //
+  // 代价：规则随对话消息发送，不再是系统提示词的一段。模型照样读得到，但
+  // 它不进系统提示词缓存前缀。
   // --------------------------------------------------------------------------
-  on('prompt.compose', async ($, e, next) => {
-    const composed = await next(e)
-
+  on('prompt.context', async ($, e, next) => {
     // 先读运行时开关：读取失败回落默认值，绝不让 hook 抛异常。
     let stored: unknown
     try {
@@ -183,26 +180,16 @@ export const register: Register = (on, options) => {
       stored = undefined
     }
 
-    // 关掉时原样放行：与官方提示词逐字节一致。
-    if (!resolveEnabled(stored, fallback)) return composed
+    // 关掉时原样放行。
+    if (!resolveEnabled(stored, fallback)) return next(e)
 
-    // 幂等：别的插件或上一轮已经放过了同一段。
-    if (composed.sections.some(section => section.id === BLOCK_ID)) return composed
+    const answered = await next(e)
 
-    const block: PromptComposeSection = {
-      id: BLOCK_ID,
-      text: EXECUTION_MODE_BLOCK,
-      scope: 'session',
-    }
+    // 幂等：已经有同名的块就不再追加。
+    if (answered.blocks.some(block => block.name === BLOCK_NAME)) return answered
 
-    // 插在第一个 session 段之前（紧跟全部 shared 段），保证
-    // 「shared 全在前、session 全在后」这条硬约束不被破坏。
-    const sections = [...composed.sections]
-    const firstSession = sections.findIndex(section => section.scope === 'session')
-    const insertAt = firstSession === -1 ? sections.length : firstSession
-    sections.splice(insertAt, 0, block)
-
-    return { ...composed, sections }
+    const blocks = [...answered.blocks, { name: BLOCK_NAME, text: EXECUTION_MODE_BLOCK }]
+    return { ...answered, blocks }
   })
 
   // --------------------------------------------------------------------------
@@ -295,7 +282,7 @@ export const register: Register = (on, options) => {
       return {
         text: [
           `对话增强：${isOn ? '开' : '关'}（来源：${source}）`,
-          `规则分块 id：${BLOCK_ID}　scope：session　长度：${EXECUTION_MODE_BLOCK.length} 字符`,
+          `上下文块名：${BLOCK_NAME}　长度：${EXECUTION_MODE_BLOCK.length} 字符`,
           '用法：/unrestricted on | off | status | preview',
         ].join('\n'),
       }

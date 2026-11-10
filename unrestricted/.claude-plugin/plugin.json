@@ -1,8 +1,10 @@
 {
   "name": "unrestricted",
-  "version": "0.1.0",
-  "description": "通过 prompt.compose 向系统提示词注入一段回答风格与交付约定，统一回复的尺度、结构与表达方式。",
-  "author": { "name": "AAAYNMMM" },
+  "version": "0.2.0",
+  "description": "通过 prompt.context 向会话注入一段回答风格与交付约定，统一回复的尺度、结构和表达方式。",
+  "author": {
+    "name": "AAAYNMMM"
+  },
   "license": "MIT",
   "userConfig": {
     "enabled": {
