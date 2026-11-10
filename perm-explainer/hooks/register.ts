@@ -36,7 +36,15 @@
  * 最终走通的是改写工具参数这条路：在 tool.call 里 `next({ ...e, description })`
  * 就能改掉卡片上那段说明。系统卡片原封不动，只是文字变了。
  *
- * 三条实现上的硬约束：
+ * 一个绕不开的时间顺序问题：
+ *
+ *   注释必须写在"判定之前"，而卡片是否出现要等"判定之后"才知道。
+ *   换句话说，插件无法做到"看到卡片再补注释"。
+ *   好在没出现卡片时，那段注释根本不会有人看到，代价只是白花一次模型调用。
+ *   为了把这个代价压到最低，插件只对**高危命令**生成解释（见 RISKY_PATTERNS）：
+ *   这类命令正是分类器最可能拦下来交给人审的，其余命令直接放行、零延迟。
+ *
+ * 四条实现上的硬约束：
  *
  *   A. tool.call 里参数是**平铺在 e 上**的（Bash 是 e.command、Edit 是 e.file_path），
  *      没有 e.input 字段。要问引擎判定时，得自己把这些参数摘出来，
@@ -44,11 +52,14 @@
  *
  *   B. 只有**带 description 字段的工具**（Bash、PowerShell）卡片上才有可替换的文字。
  *      Edit 的卡片显示的是新旧内容对照、Write 显示路径，都不需要也没法替换，
- *      所以那些工具直接放行，零成本零延迟。
+ *      所以那些工具直接放行。
  *
- *   C. 只在"这次真会问你"的时候才生成解释。判定靠 $.tool.check 查询：
- *      它返回的 ask 表示"交给模式裁决"，其中 auto 模式下分类器多半会直接放行。
- *      所以查询结果不是 ask 的调用一律不碰，避免给静默通过的操增加延迟。
+ *   C. 引擎查询返回的 ask 只是"交给模式裁决"，不等于"一定会弹卡片"。
+ *      auto 模式下分类器常常直接放行 —— 这时卡片不会出现，注释也就没人看到。
+ *      这是现象，不是故障，插件无法改变它。
+ *
+ *   D. 所以判断顺序是：先看命令是否高危（便宜）→ 再问引擎（便宜）→
+ *      最后才调模型（贵）。任何一步不满足都直接放行。
  *
  * ============================================================================
  * 三、理解这份代码只需要三个概念
@@ -120,6 +131,41 @@ const SYSTEM = [
 ].join('\n')
 
 /**
+ * 需要解释的"高危命令"特征。
+ *
+ * 为什么要有这份清单：生成解释要调一次模型（约 1 秒），
+ * 而卡片是否出现要等判定之后才知道。不筛的话，每条候选命令都要白花这 1 秒。
+ * 这里列的都是破坏性、越权或影响系统状态的命令 ——
+ * 也正是分类器最可能拦下来交给人审核的类型。
+ *
+ * 想增删请直接改这个数组：每条是一个正则，命中任意一条就算高危。
+ * 匹配的是整条命令字符串，大小写不敏感。
+ */
+const RISKY_PATTERNS: readonly RegExp[] = [
+  /\brm\b/i, // 删除文件
+  /\brmdir\b/i, // 删除目录
+  /\bdel\b/i, // Windows 删除
+  /\bgit\s+push\b/i, // 推送代码
+  /\bgit\s+reset\s+--hard\b/i, // 丢弃本地改动
+  /\bsudo\b/i, // 提权执行
+  /\bchmod\b/i, // 改文件权限
+  /\bchown\b/i, // 改文件所有者
+  /\bdd\b/i, // 块设备直写
+  /\bmkfs\b/i, // 格式化
+  /\bformat\b/i, // 格式化
+  /\bshutdown\b/i, // 关机
+  /\breboot\b/i, // 重启
+  /\btaskkill\b/i, // 杀进程
+  /\breg\s+(add|delete)\b/i, // 改注册表
+  /\b(npm|pnpm|yarn)\s+(i|add|install)\b/i, // 装 JS 包
+  /\bpip\s+install\b/i, // 装 Python 包
+  /\bwinget\s+install\b/i, // 装 Windows 软件
+  /\bchoco\s+install\b/i, // 装 Windows 软件
+  /\b(curl|wget)\b[^|]*\|/i, // 下载后直接管道执行
+  /\bdrop\s+(table|database)\b/i, // 删库
+]
+
+/**
  * 工具调用对象里属于"引擎保留"的键，不是工具自己的参数。
  * 问引擎判定时要把它们去掉，否则参数校验会失败。
  */
@@ -170,6 +216,14 @@ function toolArgs(e: Record<string, unknown>): Record<string, unknown> {
 }
 
 /**
+ * 判断这条命令是否属于"值得花一次模型调用去解释"的高危命令。
+ * 命中 RISKY_PATTERNS 里任意一条即算。
+ */
+function looksRisky(command: string): boolean {
+  return RISKY_PATTERNS.some(pattern => pattern.test(command))
+}
+
+/**
  * 把一段字符串压成一行、并截断到 n 个字符。
  * 命令可能很长（比如一行几千字符的 bash -c），原文塞给模型既慢又贵，
  * 而且换行会把"三行输出"的格式搅乱，所以统一压成单行。
@@ -181,9 +235,6 @@ function clip(s: string, n: number): string {
 
 /**
  * 把工具参数压成一小段人话喂给模型。
- *
- * 为什么不直接 JSON.stringify：Write/Edit 的参数里带着整个文件内容，
- * 直接发过去可能上万字，又慢又贵，对"这步要干什么"也没什么帮助。
  * 本插件只处理命令类工具，所以主要就是把 command 和原 description 拼起来。
  */
 function compact(tool: string, input: unknown): string {
@@ -289,21 +340,26 @@ export const register: Register = on => {
   // 唯一的钩子：tool.call
   // --------------------------------------------------------------------------
   // 触发时机：Claude 发起一次工具调用时，比权限判定更早。
-  // 流程：
-  //   1. 没有 description 字段的工具（Edit、Write、Read 等）直接放行 ——
-  //      它们的卡片不用改，也不该让它们等模型
-  //   2. 问引擎这次会不会问你；不会就放行，零延迟
-  //   3. 会问，就生成三行解释，改写 description 后继续
-  //      —— 卡片上那段说明于是变成了解释，命令原文和按钮全都不变
+  // 判断顺序刻意从便宜到贵，任何一步不满足就立刻放行：
+  //   1. 这个工具有 description 字段吗？（Edit/Write 没有，直接放过）
+  //   2. 这条命令高危吗？（不在清单里就放过，零延迟）
+  //   3. 引擎这次会问你吗？（不会就放过）
+  //   4. 以上都成立才调模型，写完解释再交给引擎
   on('tool.call', async ($, e, next) => {
     const fields = e as unknown as Record<string, unknown>
     const args = toolArgs(fields)
-    const original = args.description
 
-    // 只有当这个工具本身带 description 时，卡片上才有可替换的文字
-    if (typeof original !== 'string') return next(e)
+    // 第 1 步：只有带 description 的工具，卡片上才有可替换的文字
+    if (typeof args.description !== 'string') return next(e)
 
-    // ---- 问引擎：这次会不会问你 ----
+    // 第 2 步：不在高危清单里的命令，不值得花一次模型调用
+    const command = typeof args.command === 'string' ? args.command : ''
+    if (!looksRisky(command)) {
+      await logLine($, `tool.call ${e.tool}：命令不在高危清单，跳过解释`)
+      return next(e)
+    }
+
+    // 第 3 步：问引擎这次会不会问你
     // $.tool.check 是"只询问、不执行"的查询，返回 { decision, rule?, setting? }。
     // 注意参数要传工具自己的参数（args），不是 e.input —— e 上没有 input 字段。
     let decision: string
@@ -317,10 +373,10 @@ export const register: Register = on => {
       return next(e)
     }
 
-    await logLine($, `tool.call ${e.tool}：查询判定 ${decision}`)
+    await logLine($, `tool.call ${e.tool}：高危命令，查询判定 ${decision}`)
     if (decision !== 'ask') return next(e)
 
-    // ---- 生成解释 ----
+    // 第 4 步：生成解释
     const r = await getExplanation($, e.tool, args)
     await logLine(
       $,
