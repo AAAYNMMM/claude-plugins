@@ -16,14 +16,9 @@ import { copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSyn
 import { homedir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 
-import { dirname as dirnameOf, resolve as resolvePath } from 'node:path'
-import { fileURLToPath } from 'node:url'
-
 const HOME = join(homedir(), '.workbuddy-claude')
 const CONFIG_PATH = join(HOME, 'config.json')
 const MARKER_PATH = join(HOME, 'installed.json')
-const ROOT = resolvePath(dirnameOf(fileURLToPath(import.meta.url)), '..')
-const SERVER_PATH = join(ROOT, 'dist', 'server.js')
 
 /** Claude Code 读取的上下文窗口上限：模型标称 1000k，留一截给工具输出和压缩余量。 */
 const AUTO_COMPACT_WINDOW = '800000'
@@ -105,15 +100,8 @@ function enable(scope, projectDir) {
   for (const key of ENV_KEYS) env[key] = desired[key]
   settings.env = env
 
-  // 状态栏：显示当前模型、WB 账号与积分。它和执行环境变量是两件事，
-  // 所以单独记录原值，disable 时按记录还原（旧记录没有这个字段就不碰）。
-  const previousStatusLine = existing !== undefined && 'previousStatusLine' in existing
-    ? existing.previousStatusLine
-    : ('statusLine' in settings ? settings.statusLine : null)
-  settings.statusLine = {
-    type: 'command',
-    command: `"${process.execPath}" "${SERVER_PATH}" statusline`,
-  }
+  // 积分与账号不做常驻显示：账号名和余额留在界面上有泄漏风险。
+  // 需要时用 /workbuddy-status 按需查询。
 
   // 备份一次原文件，给“整份还原”留后路。
   if (existsSync(target) && existing === undefined) {
@@ -124,7 +112,7 @@ function enable(scope, projectDir) {
 
   marker.installs = [
     ...marker.installs.filter(entry => entry.path !== target),
-    { path: target, scope, previous, previousStatusLine },
+    { path: target, scope, previous },
   ]
   writeJson(target, settings)
   writeJson(MARKER_PATH, marker)
@@ -133,7 +121,6 @@ function enable(scope, projectDir) {
   process.stdout.write(`  ANTHROPIC_BASE_URL=${desired.ANTHROPIC_BASE_URL}\n`)
   process.stdout.write(`  ANTHROPIC_MODEL=${desired.ANTHROPIC_MODEL}\n`)
   process.stdout.write(`  ANTHROPIC_SMALL_FAST_MODEL=${desired.ANTHROPIC_SMALL_FAST_MODEL}\n`)
-  process.stdout.write(`  statusLine=${SERVER_PATH} statusline\n`)
 }
 
 /** disable：按安装记录逐键还原，不碰其它键。 */

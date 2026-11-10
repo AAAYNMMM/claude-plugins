@@ -154,7 +154,7 @@ node dist/server.js models
 | `minimax-m3.1-flash` | x0.08 | 1000k |
 | `hy4std` / `hy4free` | x0.29 / x0 | 960k |
 
-## 换账号与积分显示
+## 换账号与积分查询
 
 ### 在 WorkBuddy 桌面端换账号
 
@@ -173,27 +173,23 @@ node dist/server.js models
 另外，如果你在 DSH 插件卡片里**显式选过**某个账号，那个选择会被严格绑定、不跟随桌面端；
 本网关没有设置显式账号，所以默认跟随桌面端当前登录。
 
-### 积分
+### 积分查询（按需，不常驻）
 
-状态栏会显示一行：
+账号名和余额**不做常驻显示**：把账号与额度一直摆在界面上有泄漏风险。
+需要时手动查一次：
 
 ```
-deepseek-v4-pro · WB tornado · 469.59
+/workbuddy-status
 ```
 
-- 左侧是当前模型（Claude Code 通过 stdin 传进来）；
-- 中间是正在服务的 WorkBuddy 账号；
-- 右侧是剩余积分，**60 秒缓存**，不会每次重绘都打上游；
-- 网关没起来时显示 `WB · 网关未运行`，未登录时显示 `WB 未登录`。
-
-完整信息（区域、域名、有效期、模型数量）用 `/workbuddy-status` 或：
+或者：
 
 ```bash
 node dist/server.js status
 ```
 
-状态栏是安装脚本写进 `~/.claude/settings.json` 的 `statusLine` 字段；`disable` / `uninstall`
-会按安装记录还原你原来的状态栏。
+输出包含区域、账号、域名、登录有效期、剩余积分和模型数量。
+网关侧的积分读取有 60 秒缓存，反复查询不会打穿上游接口。
 
 ---
 
