@@ -73,7 +73,11 @@ if ((process.argv[2] ?? 'list') === 'list') {
 const catalog = readCatalog()
 
 // DeepSeek 透传始终保留一条，保证 App 切换回 DeepSeek 时不缺项。
-routes[DEEPSEEK_ALIAS] = { provider: 'deepseek', label: 'DeepSeek · Sonnet' }
+// 已经有 DeepSeek 路由时不再覆盖：用户可能改过它的显示名或模型名，
+// 每次同步都重置会让他的修改凭空消失。
+if (!Object.values(routes).some(route => route.provider === 'deepseek')) {
+  routes[DEEPSEEK_ALIAS] = { provider: 'deepseek', label: 'DeepSeek · Sonnet' }
+}
 
 /** 已经被占用的别名。 */
 const used = new Set(Object.keys(routes))

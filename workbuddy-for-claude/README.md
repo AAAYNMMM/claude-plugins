@@ -1,15 +1,6 @@
-# workbuddy-for-claude
+# claude-workbuddy
 
 把本机已登录的 **WorkBuddy 模型**接入 **Claude Code**，并且和 DeepSeek 放在同一个模型列表里，切模型即切提供方。
-
-## 作为插件安装
-
-```bash
-/plugin marketplace add AAAYNMMM/claude-plugins
-/plugin install workbuddy-for-claude@aaaynmmm-plugins
-```
-
-插件提供 `/workbuddy-status` 和 `/workbuddy-models` 两条斜杠命令。网关的配置（环境变量、模型列表、桌面 App 的 provider）仍需按下面的步骤执行一次——Claude Code 的插件无法修改模型的 Base URL，只能由安装脚本写入。
 
 原插件 [dingminhua/dsh-connect-workbuddy](https://github.com/dingminhua/dsh-connect-workbuddy) 是给 DeepSeek Harness（DSH）用的：它从 WorkBuddy 桌面端读取登录凭据，在本机起一个 **OpenAI 协议**的回环服务，再把模型注册进 DSH 的模型选择器。
 
@@ -57,6 +48,27 @@ node scripts/app-provider.mjs apply     # 自动备份，然后重启 App
 ```
 
 如果某个模型没出现在 App 列表里，说明 App 不认那个别名——`scripts/routes.mjs` 顶部的 `ALIAS_POOL` 里换一个 Anthropic 模型名重跑即可。
+
+### 修改 DeepSeek 那条路由
+
+接入网关后，桌面 App 的「推理配置」只负责 Base URL 和模型列表，**不再决定哪个模型走 DeepSeek**——那由网关的 `routes` 决定。DeepSeek 条目长这样：
+
+```json
+"claude-sonnet-5.5": { "provider": "deepseek", "label": "DeepSeek · Sonnet" }
+```
+
+- 键（`claude-sonnet-5.5`）：真正发给 DeepSeek 的模型名；
+- `label`：模型选择器里显示的名字。
+
+用脚本改（推荐，会顺手同步到 App 并重启网关）：
+
+```bash
+node scripts/deepseek-route.mjs show
+node scripts/deepseek-route.mjs set --label "DeepSeek V4 Flash" --apply
+node scripts/deepseek-route.mjs set --alias claude-opus-4-8 --label "DeepSeek V4 Pro" --apply
+```
+
+想完全回到原来的「App 直连 DeepSeek」配置：`node scripts/app-provider.mjs restore`，然后重启 App。
 
 ---
 
