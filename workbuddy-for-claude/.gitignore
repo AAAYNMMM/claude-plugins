@@ -1,0 +1,4 @@
+# 构建时从 vendor/native 复制出来的运行期目录，不入库
+/native/
+*.log
+node_modules/
