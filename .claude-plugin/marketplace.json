@@ -1,11 +1,5 @@
 {
   "name": "claude-plugins",
   "owner": { "name": "AAAYNMMM" },
-  "plugins": [
-    {
-      "name": "perm-explainer",
-      "source": "./perm-explainer",
-      "description": "把系统权限卡片顶部的说明换成分三行的中文解释：作用 / 影响 / 风险。"
-    }
-  ]
+  "plugins": []
 }
