@@ -41,6 +41,8 @@ node scripts/routes.mjs list     # 看看当前是怎么映射的
 
 为什么要别名：桌面 App 要求模型条目的 `name` 必须是一个 Anthropic 模型 ID，而目录里有 16 个 WorkBuddy 模型。脚本用一组不同的 Anthropic 模型名（`claude-opus-5-5`、`claude-sonnet-4-6` 等）分别绑定它们，用户看到的显示名（`labelOverride`）则是 `WB · 模型 id (倍率)`。
 
+**别名不能写成厂商名。** App 的校验规则是：名字只要命中一张厂商黑名单（`deepseek`、`glm`、`kimi`、`hy3`、`mimo`、`minimax`、`qwen`、`gpt` 等），就直接判为「不是 Anthropic 模型」并标警告；通过黑名单后，名字里含 `claude` 或 `anthropic` 才算合法。所以 `claude-sonnet-deepseek-v4-pro` 这类语义名不可行——想让人看懂是哪个模型，只能靠 `labelOverride`，它不参与校验。
+
 同步完路由后，重启网关并把列表写进 App：
 
 ```bash
