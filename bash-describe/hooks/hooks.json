@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node -e \"console.log(JSON.stringify({hookSpecificOutput:{hookEventName:'SessionStart',additionalContext:'调用 Bash 工具时，description 参数必须用简体中文写清三件事：这条命令做什么；会改动哪些文件或系统状态；风险高低与是否可逆。控制在 80 字以内。'}}))\""
+          }
+        ]
+      }
+    ]
+  }
+}

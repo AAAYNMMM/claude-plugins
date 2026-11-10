@@ -1,5 +1,11 @@
 {
   "name": "claude-plugins",
   "owner": { "name": "AAAYNMMM" },
-  "plugins": []
+  "plugins": [
+    {
+      "name": "bash-describe",
+      "source": "./bash-describe",
+      "description": "每次会话开始时注入一条规则：Bash 命令的说明必须写清做法、影响和风险。"
+    }
+  ]
 }

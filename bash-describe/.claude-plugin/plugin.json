@@ -1,0 +1,7 @@
+{
+  "name": "bash-describe",
+  "version": "0.1.0",
+  "description": "每次会话开始时注入一条规则：Bash 命令的说明必须写清做法、影响和风险。",
+  "author": { "name": "AAAYNMMM" },
+  "license": "MIT"
+}

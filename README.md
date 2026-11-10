@@ -1,13 +1,13 @@
 # claude-plugins
 
-自用的 Claude Code 插件集合仓库。结构已经搭好，目前还没有插件。
+自用的 Claude Code 插件集合仓库。
 
 ## 换电脑后怎么装
 
-有插件之后，在 Claude Code 的终端会话里执行：
+在 Claude Code 的终端会话里执行：
 
 ```
-/plugin install <插件名> --marketplace AAAYNMMM/claude-plugins
+/plugin install bash-describe --marketplace AAAYNMMM/claude-plugins
 ```
 
 第一次会问要不要添加这个市场仓库，答 `y`，然后选安装范围（推荐 user，全局可用）。
@@ -26,6 +26,12 @@ claude-plugins/
    └─ README.md                      这个插件做什么、怎么调
 ```
 
+## 插件清单
+
+| 插件 | 作用 |
+|---|---|
+| [bash-describe](./bash-describe) | 每次会话开始时注入规则：Bash 命令的说明要写清做法、影响、风险 |
+
 ## 新增一个插件
 
 1. 建一个文件夹，名字就是插件名；
@@ -35,12 +41,8 @@ claude-plugins/
    ```json
    { "name": "<插件名>", "source": "./<插件名>", "description": "<一句话>" }
    ```
-5. 在下面的"插件清单"表格里加一行；
+5. 在"插件清单"表格里加一行；
 6. 提交并推送。
-
-## 插件清单
-
-（暂无）
 
 ## 历史
 
