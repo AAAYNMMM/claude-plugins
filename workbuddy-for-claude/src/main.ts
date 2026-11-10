@@ -440,6 +440,8 @@ async function readStdinJson(): Promise<Record<string, unknown> | undefined> {
  * 且最多等 400ms；网关没起来时也必须立刻给出文字，不能把界面拖住。
  */
 async function printStatusLine(config: Config): Promise<void> {
+  // --compact：只输出「WB · 余额」，不带账号名，减少界面上暴露的信息。
+  const compact = process.argv.includes('--compact')
   const input = await readStdinJson()
   const model = input?.['model'] as { display_name?: string; id?: string } | undefined
   let text = 'WB · 网关未运行'
@@ -452,7 +454,9 @@ async function printStatusLine(config: Config): Promise<void> {
       const status = await response.json() as { signedIn?: boolean; account?: string; credits?: number }
       if (status.signedIn === true) {
         const credits = typeof status.credits === 'number' ? status.credits.toFixed(2) : '积分不可用'
-        text = `WB ${status.account ?? ''} · ${credits}`.trim()
+        text = compact
+          ? `WB · ${credits}`
+          : `WB ${status.account ?? ''} · ${credits}`.trim()
       } else {
         text = 'WB 未登录'
       }

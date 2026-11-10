@@ -7738,6 +7738,7 @@ async function readStdinJson() {
   });
 }
 async function printStatusLine(config) {
+  const compact = process.argv.includes("--compact");
   const input = await readStdinJson();
   const model = input?.["model"];
   let text2 = "WB \xB7 \u7F51\u5173\u672A\u8FD0\u884C";
@@ -7750,7 +7751,7 @@ async function printStatusLine(config) {
       const status = await response.json();
       if (status.signedIn === true) {
         const credits = typeof status.credits === "number" ? status.credits.toFixed(2) : "\u79EF\u5206\u4E0D\u53EF\u7528";
-        text2 = `WB ${status.account ?? ""} \xB7 ${credits}`.trim();
+        text2 = compact ? `WB \xB7 ${credits}` : `WB ${status.account ?? ""} \xB7 ${credits}`.trim();
       } else {
         text2 = "WB \u672A\u767B\u5F55";
       }
