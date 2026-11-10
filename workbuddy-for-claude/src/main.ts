@@ -256,6 +256,72 @@ async function refreshCatalog(
   }
 }
 
+/** DeepSeek 余额的缓存文件；只存查询结果，永远不含密钥。 */
+const DEEPSEEK_BALANCE_PATH = join(HOME, 'deepseek-balance.json')
+/** 两次余额查询之间的最短间隔：5 分钟。 */
+const DEEPSEEK_BALANCE_TTL_MS = 5 * 60_000
+
+/** 最近一次查到的 DeepSeek 余额。 */
+let deepSeekBalance: { currency: string; total: string; available: boolean; updatedAt: string } | undefined
+let deepSeekBalanceQueriedAtMs = 0
+
+/**
+ * 顺手查一次 DeepSeek 余额，查完立刻丢掉 Key。
+ *
+ * 安全边界（这是本功能唯一触碰 Key 的地方）：
+ *  - Key 只是这个函数的参数，函数返回后不再被任何变量引用；
+ *  - 不写盘、不写日志、不进配置；
+ *  - 只调用只读的 `GET /user/balance`，它不做模型推理、不产生 token，
+ *    所以不消耗余额。代码里没有任何"为了查余额去发一次聊天请求"的路径。
+ */
+async function refreshDeepSeekBalance(deepseekBaseUrl: string, key: string): Promise<void> {
+  if (Date.now() - deepSeekBalanceQueriedAtMs < DEEPSEEK_BALANCE_TTL_MS) return
+  deepSeekBalanceQueriedAtMs = Date.now()
+  try {
+    const origin = new URL(deepseekBaseUrl).origin
+    const response = await fetch(`${origin}/user/balance`, {
+      headers: { authorization: `Bearer ${key}`, accept: 'application/json' },
+      signal: AbortSignal.timeout(5000),
+    })
+    if (!response.ok) {
+      // 只记状态码，绝不记 Key。
+      log(`deepseek: balance query failed with HTTP ${response.status}`)
+      return
+    }
+    const data = await response.json() as {
+      is_available?: boolean
+      balance_infos?: { currency?: string; total_balance?: string }[]
+    }
+    const info = data.balance_infos?.[0]
+    if (info === undefined || typeof info.total_balance !== 'string') return
+    deepSeekBalance = {
+      currency: typeof info.currency === 'string' ? info.currency : 'CNY',
+      total: info.total_balance,
+      available: data.is_available === true,
+      updatedAt: new Date().toISOString(),
+    }
+    writeFileSync(DEEPSEEK_BALANCE_PATH, `${JSON.stringify(deepSeekBalance, null, 2)}\n`)
+  } catch {
+    // 查询失败就保留上一次的结果；不重试、不记录 Key。
+  }
+}
+
+/** `deepseek-balance` 命令：打印缓存里的余额，不触发任何上游请求。 */
+function printDeepSeekBalance(): void {
+  try {
+    const data = JSON.parse(readFileSync(DEEPSEEK_BALANCE_PATH, 'utf8')) as {
+      currency?: string
+      total?: string
+      updatedAt?: string
+    }
+    const symbol = data.currency === 'USD' ? '$' : '¥'
+    process.stdout.write(`${symbol}${data.total ?? '—'}\n`)
+    process.stdout.write(`更新于 ${data.updatedAt ?? '—'}\n`)
+  } catch {
+    process.stdout.write('还没有 DeepSeek 余额数据：先在桌面 App 里发一次走 DeepSeek 的请求。\n')
+  }
+}
+
 /**
  * 状态缓存。
  *
@@ -339,6 +405,9 @@ async function serve(config: Config): Promise<void> {
     workbuddyModels: () => runtime.catalog.current().map(model => model.id),
     resolveModel: runtime.resolveModel,
     status: () => readStatusCached(runtime.region, runtime.client, runtime.store, runtime.catalog),
+    onDeepSeekKey: key => {
+      void refreshDeepSeekBalance(config.deepseekBaseUrl, key)
+    },
     log,
   })
   await gateway.ready
@@ -526,6 +595,10 @@ async function main(): Promise<void> {
     await restartGateway(config)
     return
   }
+  if (command === 'deepseek-balance') {
+    printDeepSeekBalance()
+    return
+  }
   if (command === 'set') {
     // `set defaultModel <id>` / `set smallModel <id>` / `set port <n>` / `set region <cn|global|auto>`
     const key = process.argv[3]
@@ -553,7 +626,7 @@ async function main(): Promise<void> {
     await serve(config)
     return
   }
-  throw new Error(`unknown command: ${command} (expected serve, status, models, doctor, statusline, restart or set)`)
+  throw new Error(`unknown command: ${command} (expected serve, status, models, doctor, statusline, restart, deepseek-balance or set)`)
 }
 
 main().catch((error: unknown) => {

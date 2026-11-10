@@ -191,6 +191,24 @@ node dist/server.js status
 输出包含区域、账号、域名、登录有效期、剩余积分和模型数量。
 网关侧的积分读取有 60 秒缓存，反复查询不会打穿上游接口。
 
+### DeepSeek 余额（可选）
+
+网关在转发一次真正的 DeepSeek 请求时，会顺手用这次请求自带的 Key 调一次
+`GET /user/balance`，把结果写进 `~/.workbuddy-claude/deepseek-balance.json`，
+然后立刻丢弃 Key。
+
+- **不消耗余额**：这是只读的账户接口，不做模型推理、不产生 token；
+- 两次查询至少间隔 5 分钟；
+- Key 不落盘、不进日志、不进配置，只在那一次查询的内存里存在；
+- 只有 `loopback` 鉴权模式下才会触发（终端模式带的是本地令牌，不是 DeepSeek Key）；
+- 网关重启后，要等你先发一次走 DeepSeek 的请求才有数据。
+
+查看结果：
+
+```bash
+node dist/server.js deepseek-balance
+```
+
 ---
 
 ## 停用 / 启用 / 卸载

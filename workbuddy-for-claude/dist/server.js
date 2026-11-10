@@ -7322,6 +7322,15 @@ function createGateway(options) {
     if (typeof apiKey === "string") headers["x-api-key"] = apiKey;
     if (typeof version === "string") headers["anthropic-version"] = version;
     if (typeof beta === "string") headers["anthropic-beta"] = beta;
+    if (options.authMode === "loopback" && options.onDeepSeekKey !== void 0) {
+      const bearer = typeof auth === "string" ? auth.replace(/^Bearer\s+/i, "").trim() : typeof apiKey === "string" ? apiKey.trim() : "";
+      if (bearer !== "") {
+        try {
+          options.onDeepSeekKey(bearer);
+        } catch {
+        }
+      }
+    }
     const controller = new AbortController();
     res.on("close", () => {
       if (!res.writableFinished) controller.abort();
@@ -7586,6 +7595,49 @@ async function refreshCatalog(client, store, catalog) {
     log(`catalog: refresh failed: ${String(error)}`);
   }
 }
+var DEEPSEEK_BALANCE_PATH = join9(HOME, "deepseek-balance.json");
+var DEEPSEEK_BALANCE_TTL_MS = 5 * 6e4;
+var deepSeekBalance;
+var deepSeekBalanceQueriedAtMs = 0;
+async function refreshDeepSeekBalance(deepseekBaseUrl, key) {
+  if (Date.now() - deepSeekBalanceQueriedAtMs < DEEPSEEK_BALANCE_TTL_MS) return;
+  deepSeekBalanceQueriedAtMs = Date.now();
+  try {
+    const origin = new URL(deepseekBaseUrl).origin;
+    const response = await fetch(`${origin}/user/balance`, {
+      headers: { authorization: `Bearer ${key}`, accept: "application/json" },
+      signal: AbortSignal.timeout(5e3)
+    });
+    if (!response.ok) {
+      log(`deepseek: balance query failed with HTTP ${response.status}`);
+      return;
+    }
+    const data = await response.json();
+    const info = data.balance_infos?.[0];
+    if (info === void 0 || typeof info.total_balance !== "string") return;
+    deepSeekBalance = {
+      currency: typeof info.currency === "string" ? info.currency : "CNY",
+      total: info.total_balance,
+      available: data.is_available === true,
+      updatedAt: (/* @__PURE__ */ new Date()).toISOString()
+    };
+    writeFileSync(DEEPSEEK_BALANCE_PATH, `${JSON.stringify(deepSeekBalance, null, 2)}
+`);
+  } catch {
+  }
+}
+function printDeepSeekBalance() {
+  try {
+    const data = JSON.parse(readFileSync2(DEEPSEEK_BALANCE_PATH, "utf8"));
+    const symbol = data.currency === "USD" ? "$" : "\xA5";
+    process.stdout.write(`${symbol}${data.total ?? "\u2014"}
+`);
+    process.stdout.write(`\u66F4\u65B0\u4E8E ${data.updatedAt ?? "\u2014"}
+`);
+  } catch {
+    process.stdout.write("\u8FD8\u6CA1\u6709 DeepSeek \u4F59\u989D\u6570\u636E\uFF1A\u5148\u5728\u684C\u9762 App \u91CC\u53D1\u4E00\u6B21\u8D70 DeepSeek \u7684\u8BF7\u6C42\u3002\n");
+  }
+}
 var statusCache;
 var STATUS_CACHE_MS = 6e4;
 async function readStatusCached(region, client, store, catalog) {
@@ -7645,6 +7697,9 @@ async function serve(config) {
     workbuddyModels: () => runtime.catalog.current().map((model) => model.id),
     resolveModel: runtime.resolveModel,
     status: () => readStatusCached(runtime.region, runtime.client, runtime.store, runtime.catalog),
+    onDeepSeekKey: (key) => {
+      void refreshDeepSeekBalance(config.deepseekBaseUrl, key);
+    },
     log
   });
   await gateway.ready;
@@ -7814,6 +7869,10 @@ async function main() {
     await restartGateway(config);
     return;
   }
+  if (command === "deepseek-balance") {
+    printDeepSeekBalance();
+    return;
+  }
   if (command === "set") {
     const key = process.argv[3];
     const value = process.argv[4];
@@ -7841,7 +7900,7 @@ async function main() {
     await serve(config);
     return;
   }
-  throw new Error(`unknown command: ${command} (expected serve, status, models, doctor, statusline, restart or set)`);
+  throw new Error(`unknown command: ${command} (expected serve, status, models, doctor, statusline, restart, deepseek-balance or set)`);
 }
 main().catch((error) => {
   log(`fatal: ${String(error)}`);

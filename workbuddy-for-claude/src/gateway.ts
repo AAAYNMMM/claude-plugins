@@ -63,6 +63,13 @@ export interface GatewayOptions {
   resolveModel: (requested: string | undefined) => string
   /** 账号与积分等只读状态。 */
   status: () => Promise<Record<string, unknown>>
+  /**
+   * 一次真正走 DeepSeek 的请求带来了调用方的 Key。
+   *
+   * 只在 `loopback` 鉴权模式下触发：终端那种 `token` 模式里，请求头带的是本网关
+   * 自己的本地令牌，不是 DeepSeek 的 Key，绝不能拿它去问上游。
+   */
+  onDeepSeekKey?: (key: string) => void
   /** 写日志。 */
   log: (message: string) => void
 }
@@ -275,6 +282,22 @@ export function createGateway(options: GatewayOptions): Gateway {
     if (typeof apiKey === 'string') headers['x-api-key'] = apiKey
     if (typeof version === 'string') headers['anthropic-version'] = version
     if (typeof beta === 'string') headers['anthropic-beta'] = beta
+
+    // 只有 loopback 模式下，这个头里的才是调用方真正的 DeepSeek Key；
+    // token 模式带的是本网关的本地令牌，不能拿去问上游。回调只在本次请求内存里
+    // 拿到这个值，查询完即丢弃，不落盘、不写日志。
+    if (options.authMode === 'loopback' && options.onDeepSeekKey !== undefined) {
+      const bearer = typeof auth === 'string'
+        ? auth.replace(/^Bearer\s+/i, '').trim()
+        : (typeof apiKey === 'string' ? apiKey.trim() : '')
+      if (bearer !== '') {
+        try {
+          options.onDeepSeekKey(bearer)
+        } catch {
+          // 余额查询只是附带信息，失败绝不打断转发。
+        }
+      }
+    }
 
     const controller = new AbortController()
     res.on('close', () => {
