@@ -1,0 +1,15 @@
+{
+  "name": "ds-credits",
+  "version": "0.1.0",
+  "description": "在桌面版底部状态栏显示 DeepSeek 余额（读取 claude-workbuddy 网关写入的余额文件）。",
+  "author": { "name": "AAAYNMMM" },
+  "license": "MIT",
+  "userConfig": {
+    "balanceFile": {
+      "type": "string",
+      "title": "余额文件路径",
+      "description": "claude-workbuddy 网关写入的 deepseek-balance.json 绝对路径。",
+      "default": "C:/Users/11830/.workbuddy-claude/deepseek-balance.json"
+    }
+  }
+}

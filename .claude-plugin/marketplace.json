@@ -16,6 +16,11 @@
       "name": "unrestricted",
       "source": "./unrestricted",
       "description": "通过 prompt.compose 向系统提示词注入回答风格与交付约定，统一回复的尺度、结构和表达方式。"
+    },
+    {
+      "name": "ds-credits",
+      "source": "./ds-credits",
+      "description": "在桌面版底部状态栏显示 DeepSeek 余额（读取 claude-workbuddy 网关写入的余额文件，不接触 API Key）。"
     }
   ]
 }
