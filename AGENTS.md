@@ -4,11 +4,15 @@
 
 ## 仓库是什么
 
-一个 Claude Code 插件市场仓库。`owner/repo` 为 `AAAYNMMM/claude-plugins`，市场名为 `claude-plugins`。
+一个 Claude Code 插件市场仓库。`owner/repo` 为 `AAAYNMMM/claude-plugins`，市场名为 `aaaynmmm-plugins`。
+
+> 注意：市场名不能以 `claude` 开头。Claude Code 会把这类名字判定为"冒充 Anthropic 官方市场"
+> 并拒绝整个仓库（报错 `Marketplace name impersonates an official Anthropic/Claude marketplace`）。
+> 仓库目录名可以叫 claude-plugins，但 `marketplace.json` 的 `name` 字段不行。
 
 唯一的事实来源是 `.claude-plugin/marketplace.json`：
 
-- `name`：市场名（`claude-plugins`）
+- `name`：市场名（`aaaynmmm-plugins`）
 - `plugins[]`：插件列表
   - `plugins[].name`：插件名，同时也是仓库里的文件夹名
   - `plugins[].source`：插件目录，形如 `./<插件名>`
@@ -41,11 +45,11 @@ claude --version
 claude plugin install <插件名> --marketplace AAAYNMMM/claude-plugins -y --json
 ```
 
-- 首次执行会自动添加市场（打印 `Successfully added marketplace: claude-plugins`），无需额外步骤。
+- 首次执行会自动添加市场（打印 `Successfully added marketplace: aaaynmmm-plugins`），无需额外步骤。
 - 作用域默认 user（对本机所有项目生效），不加 `--scope`。
 - `-y` 用于无人值守：接受市场声明的命令，非交互环境下必需。
 - `--json` 输出一行机器可读结果，便于判断成功与否；去掉它则输出人类可读文本。
-- 成功时输出 `Successfully installed plugin: <插件名>@claude-plugins (scope: user)`。
+- 成功时输出 `Successfully installed plugin: <插件名>@aaaynmmm-plugins (scope: user)`。
 - 本仓库的插件都是 `directory` 源，不会触发需要确认的命令安装，`-y` 实际不会用到。
 
 ### 3. 验证
@@ -85,7 +89,7 @@ claude plugin list
 
 ### 修改插件
 
-改 `version` 字段，然后提交推送。已安装的机器用 `claude plugin update <插件名>@claude-plugins` 更新。
+改 `version` 字段，然后提交推送。已安装的机器用 `claude plugin update <插件名>@aaaynmmm-plugins` 更新。
 
 ### 删除插件
 
