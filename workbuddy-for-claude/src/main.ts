@@ -97,8 +97,13 @@ function log(message: string): void {
   process.stdout.write(line)
 }
 
-/** 读取配置；文件缺失或字段缺失时补上缺省值并立即写回。 */
-function loadConfig(): Config {
+/**
+ * 读取配置；文件缺失或字段缺失时补上缺省值。
+ *
+ * `persist` 默认为真，会把补全后的配置写回磁盘。状态栏那条路径会高频执行，
+ * 必须传 false：每次重绘都写一次配置文件既浪费也可能和其它写入打架。
+ */
+function loadConfig(persist = true): Config {
   mkdirSync(HOME, { recursive: true })
   let raw: Partial<Config> = {}
   try {
@@ -121,7 +126,7 @@ function loadConfig(): Config {
       ? raw.routes as Record<string, Route>
       : DEFAULT_ROUTES,
   }
-  writeFileSync(CONFIG_PATH, `${JSON.stringify(config, null, 2)}\n`)
+  if (persist) writeFileSync(CONFIG_PATH, `${JSON.stringify(config, null, 2)}\n`)
   return config
 }
 
@@ -494,7 +499,8 @@ async function restartGateway(config: Config): Promise<void> {
 /** 入口：按命令行第一个参数分派。 */
 async function main(): Promise<void> {
   const command = process.argv[2] ?? 'serve'
-  const config = loadConfig()
+  // 状态栏只读配置，不写回：这条命令每次界面重绘都会执行。
+  const config = loadConfig(command !== 'statusline')
 
   if (command === 'models') {
     await printModelList(config)

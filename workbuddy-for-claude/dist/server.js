@@ -7478,7 +7478,7 @@ function log(message) {
   }
   process.stdout.write(line);
 }
-function loadConfig() {
+function loadConfig(persist = true) {
   mkdirSync(HOME, { recursive: true });
   let raw = {};
   try {
@@ -7496,7 +7496,7 @@ function loadConfig() {
     deepseekBaseUrl: typeof raw.deepseekBaseUrl === "string" && raw.deepseekBaseUrl.startsWith("https://") ? raw.deepseekBaseUrl : "https://api.deepseek.com/anthropic",
     routes: raw.routes !== null && typeof raw.routes === "object" && !Array.isArray(raw.routes) && Object.keys(raw.routes).length > 0 ? raw.routes : DEFAULT_ROUTES
   };
-  writeFileSync(CONFIG_PATH, `${JSON.stringify(config, null, 2)}
+  if (persist) writeFileSync(CONFIG_PATH, `${JSON.stringify(config, null, 2)}
 `);
   return config;
 }
@@ -7792,7 +7792,7 @@ async function restartGateway(config) {
 }
 async function main() {
   const command = process.argv[2] ?? "serve";
-  const config = loadConfig();
+  const config = loadConfig(command !== "statusline");
   if (command === "models") {
     await printModelList(config);
     return;
