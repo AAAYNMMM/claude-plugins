@@ -7613,14 +7613,21 @@ async function refreshDeepSeekBalance(deepseekBaseUrl, key) {
       return;
     }
     const data = await response.json();
-    const info = data.balance_infos?.[0];
-    if (info === void 0 || typeof info.total_balance !== "string") return;
-    deepSeekBalance = {
+    const balances = (Array.isArray(data.balance_infos) ? data.balance_infos : []).filter((info) => typeof info?.total_balance === "string").map((info) => ({
       currency: typeof info.currency === "string" ? info.currency : "CNY",
-      total: info.total_balance,
+      total: info.total_balance
+    }));
+    if (balances.length === 0) return;
+    const chosen = balances.find((balance) => Number.parseFloat(balance.total) > 0) ?? balances[0];
+    if (chosen === void 0) return;
+    deepSeekBalance = {
+      currency: chosen.currency,
+      total: chosen.total,
       available: data.is_available === true,
-      updatedAt: (/* @__PURE__ */ new Date()).toISOString()
+      updatedAt: (/* @__PURE__ */ new Date()).toISOString(),
+      balances
     };
+    log(`deepseek: balance ${chosen.currency} ${chosen.total} (${balances.length} currencies)`);
     writeFileSync(DEEPSEEK_BALANCE_PATH, `${JSON.stringify(deepSeekBalance, null, 2)}
 `);
   } catch {
@@ -7629,9 +7636,13 @@ async function refreshDeepSeekBalance(deepseekBaseUrl, key) {
 function printDeepSeekBalance() {
   try {
     const data = JSON.parse(readFileSync2(DEEPSEEK_BALANCE_PATH, "utf8"));
-    const symbol = data.currency === "USD" ? "$" : "\xA5";
-    process.stdout.write(`${symbol}${data.total ?? "\u2014"}
+    const all = Array.isArray(data.balances) && data.balances.length > 0 ? data.balances : [{ currency: data.currency, total: data.total }];
+    for (const entry of all) {
+      const symbol = entry.currency === "USD" ? "$" : "\xA5";
+      const mark = entry.currency === data.currency && entry.total === data.total ? "  \u2190 \u663E\u793A\u4E2D" : "";
+      process.stdout.write(`${entry.currency ?? "?"} ${symbol}${entry.total ?? "\u2014"}${mark}
 `);
+    }
     process.stdout.write(`\u66F4\u65B0\u4E8E ${data.updatedAt ?? "\u2014"}
 `);
   } catch {

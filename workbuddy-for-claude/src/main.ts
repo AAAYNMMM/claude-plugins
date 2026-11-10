@@ -262,7 +262,14 @@ const DEEPSEEK_BALANCE_PATH = join(HOME, 'deepseek-balance.json')
 const DEEPSEEK_BALANCE_TTL_MS = 5 * 60_000
 
 /** 最近一次查到的 DeepSeek 余额。 */
-let deepSeekBalance: { currency: string; total: string; available: boolean; updatedAt: string } | undefined
+let deepSeekBalance: {
+  currency: string
+  total: string
+  available: boolean
+  updatedAt: string
+  /** 上游返回的全部币种，界面上显示的那条是其中选出来的。 */
+  balances: { currency: string; total: string }[]
+} | undefined
 let deepSeekBalanceQueriedAtMs = 0
 
 /**
@@ -292,14 +299,25 @@ async function refreshDeepSeekBalance(deepseekBaseUrl: string, key: string): Pro
       is_available?: boolean
       balance_infos?: { currency?: string; total_balance?: string }[]
     }
-    const info = data.balance_infos?.[0]
-    if (info === undefined || typeof info.total_balance !== 'string') return
+    // 上游可能同时给出 CNY 与 USD 两条，其中一条常是 0。全部留下，并优先选非零的那条，
+    // 否则界面上会出现「余额 0」这种看着像出错的结果。
+    const balances = (Array.isArray(data.balance_infos) ? data.balance_infos : [])
+      .filter(info => typeof info?.total_balance === 'string')
+      .map(info => ({
+        currency: typeof info.currency === 'string' ? info.currency : 'CNY',
+        total: info.total_balance as string,
+      }))
+    if (balances.length === 0) return
+    const chosen = balances.find(balance => Number.parseFloat(balance.total) > 0) ?? balances[0]
+    if (chosen === undefined) return
     deepSeekBalance = {
-      currency: typeof info.currency === 'string' ? info.currency : 'CNY',
-      total: info.total_balance,
+      currency: chosen.currency,
+      total: chosen.total,
       available: data.is_available === true,
       updatedAt: new Date().toISOString(),
+      balances,
     }
+    log(`deepseek: balance ${chosen.currency} ${chosen.total} (${balances.length} currencies)`)
     writeFileSync(DEEPSEEK_BALANCE_PATH, `${JSON.stringify(deepSeekBalance, null, 2)}\n`)
   } catch {
     // 查询失败就保留上一次的结果；不重试、不记录 Key。
@@ -313,9 +331,16 @@ function printDeepSeekBalance(): void {
       currency?: string
       total?: string
       updatedAt?: string
+      balances?: { currency?: string; total?: string }[]
     }
-    const symbol = data.currency === 'USD' ? '$' : '¥'
-    process.stdout.write(`${symbol}${data.total ?? '—'}\n`)
+    const all = Array.isArray(data.balances) && data.balances.length > 0
+      ? data.balances
+      : [{ currency: data.currency, total: data.total }]
+    for (const entry of all) {
+      const symbol = entry.currency === 'USD' ? '$' : '¥'
+      const mark = entry.currency === data.currency && entry.total === data.total ? '  ← 显示中' : ''
+      process.stdout.write(`${entry.currency ?? '?'} ${symbol}${entry.total ?? '—'}${mark}\n`)
+    }
     process.stdout.write(`更新于 ${data.updatedAt ?? '—'}\n`)
   } catch {
     process.stdout.write('还没有 DeepSeek 余额数据：先在桌面 App 里发一次走 DeepSeek 的请求。\n')
