@@ -440,11 +440,11 @@ async function readStdinJson(): Promise<Record<string, unknown> | undefined> {
  * 且最多等 400ms；网关没起来时也必须立刻给出文字，不能把界面拖住。
  */
 async function printStatusLine(config: Config): Promise<void> {
-  // --compact：只输出「WB · 余额」，不带账号名，减少界面上暴露的信息。
+  // --compact：只输出余额数字，供状态栏这种空间有限的位置使用。
   const compact = process.argv.includes('--compact')
   const input = await readStdinJson()
   const model = input?.['model'] as { display_name?: string; id?: string } | undefined
-  let text = 'WB · 网关未运行'
+  let text = compact ? '离线' : 'WB · 网关未运行'
   try {
     const response = await fetch(`http://127.0.0.1:${config.port}/v1/workbuddy/status`, {
       headers: { authorization: `Bearer ${config.token}` },
@@ -455,10 +455,10 @@ async function printStatusLine(config: Config): Promise<void> {
       if (status.signedIn === true) {
         const credits = typeof status.credits === 'number' ? status.credits.toFixed(2) : '积分不可用'
         text = compact
-          ? `WB · ${credits}`
+          ? (typeof status.credits === 'number' ? credits : '—')
           : `WB ${status.account ?? ''} · ${credits}`.trim()
       } else {
-        text = 'WB 未登录'
+        text = compact ? '未登录' : 'WB 未登录'
       }
     }
   } catch {

@@ -7741,7 +7741,7 @@ async function printStatusLine(config) {
   const compact = process.argv.includes("--compact");
   const input = await readStdinJson();
   const model = input?.["model"];
-  let text2 = "WB \xB7 \u7F51\u5173\u672A\u8FD0\u884C";
+  let text2 = compact ? "\u79BB\u7EBF" : "WB \xB7 \u7F51\u5173\u672A\u8FD0\u884C";
   try {
     const response = await fetch(`http://127.0.0.1:${config.port}/v1/workbuddy/status`, {
       headers: { authorization: `Bearer ${config.token}` },
@@ -7751,9 +7751,9 @@ async function printStatusLine(config) {
       const status = await response.json();
       if (status.signedIn === true) {
         const credits = typeof status.credits === "number" ? status.credits.toFixed(2) : "\u79EF\u5206\u4E0D\u53EF\u7528";
-        text2 = compact ? `WB \xB7 ${credits}` : `WB ${status.account ?? ""} \xB7 ${credits}`.trim();
+        text2 = compact ? typeof status.credits === "number" ? credits : "\u2014" : `WB ${status.account ?? ""} \xB7 ${credits}`.trim();
       } else {
-        text2 = "WB \u672A\u767B\u5F55";
+        text2 = compact ? "\u672A\u767B\u5F55" : "WB \u672A\u767B\u5F55";
       }
     }
   } catch {
