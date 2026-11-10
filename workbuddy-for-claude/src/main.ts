@@ -15,10 +15,12 @@
  *   node dist/server.js doctor     逐项检查凭据、目录、上游连通性
  */
 
+import { spawn } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
 import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { WorkBuddyCredentialStore } from '../vendor/src/auth.ts'
 import { deriveCatalog, WorkBuddyCatalog } from '../vendor/src/catalog.ts'
 import { createWorkBuddyShim } from '../vendor/src/shim.ts'
@@ -249,6 +251,28 @@ async function refreshCatalog(
   }
 }
 
+/**
+ * 状态缓存。
+ *
+ * 状态栏会被高频调用，而积分要打一次上游。没有缓存的话，每次重绘都会换来一次
+ * 上游请求；60 秒的缓存既让状态栏秒开，也避免把积分接口打穿。
+ */
+let statusCache: { at: number; value: Record<string, unknown> } | undefined
+const STATUS_CACHE_MS = 60_000
+
+/** 带缓存的状态读取；TTL 内直接返回上一次的结果。 */
+async function readStatusCached(
+  region: 'cn' | 'global',
+  client: WorkBuddyUpstreamClient,
+  store: WorkBuddyCredentialStore,
+  catalog: WorkBuddyCatalog,
+): Promise<Record<string, unknown>> {
+  if (statusCache !== undefined && Date.now() - statusCache.at < STATUS_CACHE_MS) return statusCache.value
+  const value = await readStatus(region, client, store, catalog)
+  statusCache = { at: Date.now(), value }
+  return value
+}
+
 /** 读取账号与积分，供 status 命令和网关的只读状态接口使用。 */
 async function readStatus(
   region: 'cn' | 'global',
@@ -309,7 +333,7 @@ async function serve(config: Config): Promise<void> {
     routes: () => config.routes,
     workbuddyModels: () => runtime.catalog.current().map(model => model.id),
     resolveModel: runtime.resolveModel,
-    status: () => readStatus(runtime.region, runtime.client, runtime.store, runtime.catalog),
+    status: () => readStatusCached(runtime.region, runtime.client, runtime.store, runtime.catalog),
     log,
   })
   await gateway.ready
@@ -378,6 +402,95 @@ async function doctor(config: Config): Promise<void> {
   process.stdout.write(`log: ${LOG_PATH}\n`)
 }
 
+/** 读 stdin 上的会话 JSON；没有输入时很快返回 undefined。 */
+async function readStdinJson(): Promise<Record<string, unknown> | undefined> {
+  if (process.stdin.isTTY) return undefined
+  return await new Promise(resolve => {
+    let text = ''
+    let finished = false
+    const done = (value: Record<string, unknown> | undefined): void => {
+      if (finished) return
+      finished = true
+      clearTimeout(timer)
+      resolve(value)
+    }
+    const timer = setTimeout(() => done(undefined), 200)
+    process.stdin.setEncoding('utf8')
+    process.stdin.on('data', chunk => { text += chunk })
+    process.stdin.on('end', () => {
+      try {
+        done(JSON.parse(text) as Record<string, unknown>)
+      } catch {
+        done(undefined)
+      }
+    })
+    process.stdin.on('error', () => done(undefined))
+  })
+}
+
+/**
+ * 状态栏：一行「模型 · WB 账号 · 积分」。
+ *
+ * Claude Code 每次重绘都会调用它，所以这里只查本机网关（不回源上游），
+ * 且最多等 400ms；网关没起来时也必须立刻给出文字，不能把界面拖住。
+ */
+async function printStatusLine(config: Config): Promise<void> {
+  const input = await readStdinJson()
+  const model = input?.['model'] as { display_name?: string; id?: string } | undefined
+  let text = 'WB · 网关未运行'
+  try {
+    const response = await fetch(`http://127.0.0.1:${config.port}/v1/workbuddy/status`, {
+      headers: { authorization: `Bearer ${config.token}` },
+      signal: AbortSignal.timeout(400),
+    })
+    if (response.ok) {
+      const status = await response.json() as { signedIn?: boolean; account?: string; credits?: number }
+      if (status.signedIn === true) {
+        const credits = typeof status.credits === 'number' ? status.credits.toFixed(2) : '积分不可用'
+        text = `WB ${status.account ?? ''} · ${credits}`.trim()
+      } else {
+        text = 'WB 未登录'
+      }
+    }
+  } catch {
+    // 网关没起来：保留默认文案。
+  }
+  const label = typeof model?.display_name === 'string' ? model.display_name : model?.id
+  process.stdout.write(`${label === undefined ? '' : `${label} · `}${text}\n`)
+}
+
+/** 重启网关：结束当前进程，等看护脚本拉起；看护不在时自己拉起一个。 */
+async function restartGateway(config: Config): Promise<void> {
+  let pid = 0
+  try {
+    pid = (JSON.parse(readFileSync(STATUS_PATH, 'utf8')) as { pid?: number }).pid ?? 0
+  } catch {
+    pid = 0
+  }
+  if (pid !== 0) {
+    try {
+      process.kill(pid)
+    } catch {
+      // 进程已经不在了。
+    }
+  }
+  for (let attempt = 0; attempt < 12; attempt += 1) {
+    await new Promise(resolve => setTimeout(resolve, 1000))
+    if (await gatewayAlreadyRunning(config.port)) {
+      process.stdout.write('网关已重启\n')
+      return
+    }
+  }
+  const server = fileURLToPath(import.meta.url)
+  const child = spawn(process.execPath, [server, 'serve'], {
+    detached: true,
+    stdio: 'ignore',
+    windowsHide: true,
+  })
+  child.unref()
+  process.stdout.write('网关已手动拉起\n')
+}
+
 /** 入口：按命令行第一个参数分派。 */
 async function main(): Promise<void> {
   const command = process.argv[2] ?? 'serve'
@@ -393,6 +506,14 @@ async function main(): Promise<void> {
   }
   if (command === 'doctor') {
     await doctor(config)
+    return
+  }
+  if (command === 'statusline') {
+    await printStatusLine(config)
+    return
+  }
+  if (command === 'restart') {
+    await restartGateway(config)
     return
   }
   if (command === 'set') {
@@ -422,7 +543,7 @@ async function main(): Promise<void> {
     await serve(config)
     return
   }
-  throw new Error(`unknown command: ${command} (expected serve, status, models, doctor or set)`)
+  throw new Error(`unknown command: ${command} (expected serve, status, models, doctor, statusline, restart or set)`)
 }
 
 main().catch((error: unknown) => {
