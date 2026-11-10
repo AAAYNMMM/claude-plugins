@@ -51,24 +51,34 @@ node scripts/app-provider.mjs apply     # 自动备份，然后重启 App
 
 如果某个模型没出现在 App 列表里，说明 App 不认那个别名——`scripts/routes.mjs` 顶部的 `ALIAS_POOL` 里换一个 Anthropic 模型名重跑即可。
 
-### 修改 DeepSeek 那条路由
+### DeepSeek 的模型由前缀决定
 
-接入网关后，桌面 App 的「推理配置」只负责 Base URL 和模型列表，**不再决定哪个模型走 DeepSeek**——那由网关的 `routes` 决定。DeepSeek 条目长这样：
+DeepSeek 的 Anthropic 兼容端点**按模型名前缀**选择上游模型并计费：
+
+| 发给 DeepSeek 的模型名 | 实际模型 |
+| --- | --- |
+| `claude-opus*` | `deepseek-v4-pro`（按 V4 Pro 计费） |
+| `claude-sonnet*`、`claude-haiku*` | `deepseek-flash` |
+
+所以「用 DeepSeek 的哪个模型」完全由 `routes` 里 DeepSeek 条目的**键**决定。默认两条：
 
 ```json
-"claude-sonnet-5.5": { "provider": "deepseek", "label": "DeepSeek · Sonnet" }
+"claude-sonnet-5.5": { "provider": "deepseek", "label": "DeepSeek · Flash" },
+"claude-opus-5.5":   { "provider": "deepseek", "label": "DeepSeek · V4 Pro" }
 ```
 
-- 键（`claude-sonnet-5.5`）：真正发给 DeepSeek 的模型名；
-- `label`：模型选择器里显示的名字。
-
-用脚本改（推荐，会顺手同步到 App 并重启网关）：
+用脚本改（会顺手同步到 App 并重启网关）：
 
 ```bash
 node scripts/deepseek-route.mjs show
-node scripts/deepseek-route.mjs set --label "DeepSeek V4 Flash" --apply
-node scripts/deepseek-route.mjs set --alias claude-opus-4-8 --label "DeepSeek V4 Pro" --apply
+node scripts/deepseek-route.mjs set --alias claude-opus-5.5 --label "DeepSeek · V4 Pro" --apply
+node scripts/deepseek-route.mjs set --alias claude-sonnet-5.5 --label "DeepSeek · Flash" --apply
+node scripts/deepseek-route.mjs remove --alias claude-sonnet-5.5 --apply
 ```
+
+注意：键名会被桌面 App 校验，不能含 `deepseek`、`glm`、`kimi` 这些厂商词（见上文），
+所以这里用 `claude-opus-5.5` / `claude-sonnet-5.5` 这种形式；带点号的写法与 WorkBuddy 的
+`claude-opus-5-5`（带连字符）是两个不同的名字，不会冲突。
 
 想完全回到原来的「App 直连 DeepSeek」配置：`node scripts/app-provider.mjs restore`，然后重启 App。
 

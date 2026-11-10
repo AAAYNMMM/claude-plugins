@@ -76,7 +76,9 @@ const catalog = readCatalog()
 // 已经有 DeepSeek 路由时不再覆盖：用户可能改过它的显示名或模型名，
 // 每次同步都重置会让他的修改凭空消失。
 if (!Object.values(routes).some(route => route.provider === 'deepseek')) {
-  routes[DEEPSEEK_ALIAS] = { provider: 'deepseek', label: 'DeepSeek · Sonnet' }
+  // DeepSeek 按前缀映射：claude-sonnet* 走 deepseek-flash，claude-opus* 走 v4-pro。
+  // 这里只补一条 Flash 兜底；要 V4 Pro 用 scripts/deepseek-route.mjs 再加一条 opus 前缀的。
+  routes[DEEPSEEK_ALIAS] = { provider: 'deepseek', label: 'DeepSeek · Flash' }
 }
 
 /** 已经被占用的别名。 */

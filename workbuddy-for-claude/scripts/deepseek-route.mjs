@@ -1,19 +1,22 @@
 /**
- * 管理发往 DeepSeek 的那条路由（显示名、以及发给 DeepSeek 的模型名）。
+ * 管理发往 DeepSeek 的路由（可以有多条）。
  *
- * 为什么需要它：接上本网关后，桌面 App 的“推理配置”里只剩一个 Base URL 和一份
- * 模型列表，真正决定某个模型走 DeepSeek 还是走 WorkBuddy 的是
- * ~/.workbuddy-claude/config.json 里的 routes。这个脚本把那条 DeepSeek 路由的
- * 修改收敛成一条命令，避免手工改 JSON 时改坏别的条目。
+ * DeepSeek 的 Anthropic 兼容端点按**模型名前缀**决定用哪个模型：
+ *   claude-opus*                 → deepseek-v4-pro（按 V4 Pro 计费）
+ *   claude-sonnet* / claude-haiku* → deepseek-flash
+ * 所以“用 DeepSeek 的哪个模型”这件事，完全由这里的别名前缀决定。
+ *
+ * 本脚本把增删改成一条命令，避免手工编辑 routes 时改坏别的条目。
  *
  * 用法：
  *   node scripts/deepseek-route.mjs show
- *   node scripts/deepseek-route.mjs set --label "DeepSeek V4 Flash"
- *   node scripts/deepseek-route.mjs set --alias claude-opus-4-8 --label "DeepSeek V4 Pro" --apply
+ *   node scripts/deepseek-route.mjs set --alias claude-opus-5.5 --label "DeepSeek · V4 Pro"
+ *   node scripts/deepseek-route.mjs set --alias claude-sonnet-5.5 --label "DeepSeek · Flash" --apply
+ *   node scripts/deepseek-route.mjs remove --alias claude-sonnet-5.5 --apply
  *
  * 参数：
+ *   --alias <模型名> 发给 DeepSeek 的模型名；前缀决定上游用哪个模型
  *   --label <文字>   模型选择器里显示的名字
- *   --alias <模型名> 发给 DeepSeek 的模型名（原名是 claude-sonnet-5.5）
  *   --apply          改完立刻同步到桌面 App，并重启网关
  */
 
@@ -36,48 +39,53 @@ function option(name) {
   return index === -1 ? undefined : argv[index + 1]
 }
 
-/** 找到当前唯一那条 DeepSeek 路由。 */
-function findDeepSeek(routes) {
-  return Object.entries(routes).find(([, route]) => route.provider === 'deepseek')
-}
-
 const config = JSON.parse(readFileSync(CONFIG_PATH, 'utf8'))
 config.routes = config.routes ?? {}
 
+/** 当前所有 DeepSeek 路由。 */
+function deepSeekRoutes() {
+  return Object.entries(config.routes).filter(([, route]) => route.provider === 'deepseek')
+}
+
 if (command === 'show') {
-  const entry = findDeepSeek(config.routes)
-  if (entry === undefined) {
+  const entries = deepSeekRoutes()
+  if (entries.length === 0) {
     process.stdout.write('当前没有 DeepSeek 路由：所有请求都走 WorkBuddy\n')
   } else {
-    const [alias, route] = entry
-    process.stdout.write(`发给 DeepSeek 的模型名：${alias}\n`)
-    process.stdout.write(`模型选择器显示名    ：${route.label ?? alias}\n`)
-    process.stdout.write(`DeepSeek 地址       ：${config.deepseekBaseUrl}\n`)
+    process.stdout.write(`DeepSeek 地址：${config.deepseekBaseUrl}\n`)
+    for (const [alias, route] of entries) {
+      const prefix = alias.toLowerCase()
+      const upstream = prefix.startsWith('claude-opus')
+        ? 'deepseek-v4-pro'
+        : 'deepseek-flash'
+      process.stdout.write(`  ${alias.padEnd(26)} → ${upstream.padEnd(16)} 显示为「${route.label ?? alias}」\n`)
+    }
   }
   process.exit(0)
 }
 
-if (command !== 'set') {
-  console.error('usage: node scripts/deepseek-route.mjs show | set --label <文字> [--alias <模型名>] [--apply]')
+if (command === 'set') {
+  const alias = option('alias')
+  if (alias === undefined || alias.trim() === '') throw new Error('--alias is required')
+  const label = option('label') ?? alias
+  const existing = config.routes[alias]
+  if (existing !== undefined && existing.provider !== 'deepseek') {
+    throw new Error(`${alias} is already a ${existing.provider} route; pick another alias`)
+  }
+  config.routes[alias] = { provider: 'deepseek', label }
+  process.stdout.write(`DeepSeek 路由：${alias}  →  显示为「${label}」\n`)
+} else if (command === 'remove') {
+  const alias = option('alias')
+  if (alias === undefined) throw new Error('--alias is required')
+  if (config.routes[alias]?.provider !== 'deepseek') throw new Error(`${alias} is not a deepseek route`)
+  delete config.routes[alias]
+  process.stdout.write(`已删除 DeepSeek 路由：${alias}\n`)
+} else {
+  console.error('usage: node scripts/deepseek-route.mjs show | set --alias <模型名> [--label <文字>] | remove --alias <模型名>  [--apply]')
   process.exit(1)
 }
 
-const entry = findDeepSeek(config.routes)
-if (entry === undefined) throw new Error('config.json has no deepseek route; run scripts/routes.mjs sync first')
-const [currentAlias, currentRoute] = entry
-const nextAlias = option('alias') ?? currentAlias
-const nextLabel = option('label') ?? currentRoute.label ?? currentAlias
-
-if (nextAlias !== currentAlias) {
-  if (config.routes[nextAlias] !== undefined) {
-    throw new Error(`alias ${nextAlias} is already used by ${config.routes[nextAlias].provider} route; pick another`)
-  }
-  delete config.routes[currentAlias]
-}
-config.routes[nextAlias] = { provider: 'deepseek', label: nextLabel }
 writeFileSync(CONFIG_PATH, `${JSON.stringify(config, null, 2)}\n`)
-
-process.stdout.write(`DeepSeek 路由已更新：${nextAlias}  →  显示为「${nextLabel}」\n`)
 
 if (!argv.includes('--apply')) {
   process.stdout.write('要让它生效：node scripts/app-provider.mjs apply，然后重启 Claude App\n')
