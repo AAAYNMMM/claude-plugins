@@ -3,12 +3,16 @@
  * 启动网关守护进程、模块聚合、路由同步与状态查询。
  */
 
-import { existsSync, writeFileSync } from 'node:fs'
+import { existsSync, readFileSync, writeFileSync } from 'node:fs'
+import { spawn } from 'node:child_process'
+import { fileURLToPath } from 'node:url'
 import {
   DATA_DIR,
   STATUS_FILE,
+  applyGatewayToClaude,
   loadGatewayConfig,
   logMessage,
+  restoreOriginalClaudeProvider,
   saveGatewayConfig,
 } from './core/config.ts'
 import { ModuleHost } from './core/module-host.ts'
@@ -80,6 +84,114 @@ async function main() {
 
   if (config.antigravity?.apiKey) {
     host.getAntigravityModule().setApiKey(config.antigravity.apiKey)
+  }
+
+  // 0. 一键开启网关并接入 Claude 桌面端
+  if (command === 'on' || command === 'enable') {
+    let isRunning = false
+    try {
+      const ping = await fetch(`http://127.0.0.1:${config.port}/v1/models`, {
+        signal: AbortSignal.timeout(1000),
+      })
+      if (ping.ok) isRunning = true
+    } catch {}
+
+    if (!isRunning) {
+      process.stdout.write(`正在启动后台网关守护进程 (端口 :${config.port})...\n`)
+      const selfPath = fileURLToPath(import.meta.url)
+      const child = spawn(process.execPath, [selfPath, 'serve'], {
+        detached: true,
+        stdio: 'ignore',
+        windowsHide: true,
+      })
+      child.unref()
+
+      // 等待服务端口就绪
+      for (let i = 0; i < 25; i++) {
+        await new Promise((r) => setTimeout(r, 200))
+        try {
+          const ping = await fetch(`http://127.0.0.1:${config.port}/v1/models`, {
+            signal: AbortSignal.timeout(500),
+          })
+          if (ping.ok) {
+            isRunning = true
+            break
+          }
+        } catch {}
+      }
+    }
+
+    let currentConfig = loadGatewayConfig()
+    if (Object.keys(currentConfig.routes).length === 0) {
+      process.stdout.write('正在初始化模型路由...\n')
+      await host.initAll({
+        gatewayPort: config.port,
+        log: () => {},
+        dataDir: DATA_DIR,
+      })
+      const aggregated = await host.aggregateModels()
+      const newRoutes: Record<string, RouteConfig> = {}
+      const usedAliases = new Set<string>()
+      aggregated.sort((a, b) => {
+        if (a.module === 'antigravity' && b.module !== 'antigravity') return -1
+        if (a.module !== 'antigravity' && b.module === 'antigravity') return 1
+        return 0
+      })
+      let aliasIdx = 0
+      for (const item of aggregated) {
+        if (item.module === 'passthrough') continue
+        while (aliasIdx < COMPLIANT_ALIASES.length && usedAliases.has(COMPLIANT_ALIASES[aliasIdx])) {
+          aliasIdx++
+        }
+        if (aliasIdx >= COMPLIANT_ALIASES.length) break
+        const alias = COMPLIANT_ALIASES[aliasIdx++]
+        usedAliases.add(alias)
+        newRoutes[alias] = {
+          module: item.module,
+          targetModel: item.model.id,
+          label: item.model.labelOverride ?? item.model.name,
+        }
+      }
+      currentConfig.routes = newRoutes
+      saveGatewayConfig(currentConfig)
+      await host.disposeAll()
+    }
+
+    try {
+      const res = applyGatewayToClaude(currentConfig.routes, currentConfig.port)
+      process.stdout.write(`\n✓ agent-gateway 网关已成功开启并接入 Claude 桌面端！\n`)
+      process.stdout.write(`  网关监听: http://127.0.0.1:${currentConfig.port}\n`)
+      process.stdout.write(`  已注入模型: ${res.modelCount} 个\n`)
+      process.stdout.write(`  提示: 请重启 Claude 桌面端以加载新模型列表。\n\n`)
+    } catch (err: any) {
+      process.stdout.write(`\n✓ agent-gateway 网关运行正常 (端口 :${currentConfig.port})\n`)
+      process.stdout.write(`  桌面端接入提示: ${err.message}\n\n`)
+    }
+    process.exit(0)
+  }
+
+  // 0.1 一键关闭网关并还原原本配置
+  if (command === 'off' || command === 'disable') {
+    process.stdout.write('正在关闭 agent-gateway 网关并还原原本配置...\n')
+    // 停止后台网关
+    try {
+      if (existsSync(STATUS_FILE)) {
+        const raw = JSON.parse(readFileSync(STATUS_FILE, 'utf8'))
+        if (raw.pid) {
+          process.kill(raw.pid, 'SIGTERM')
+        }
+      }
+    } catch {}
+
+    // 还原桌面端
+    try {
+      restoreOriginalClaudeProvider()
+      process.stdout.write(`✓ 已完整还原 Claude 桌面端原本的代理/账号配置！\n`)
+      process.stdout.write(`  提示: 请重启 Claude 桌面端生效。\n\n`)
+    } catch (err: any) {
+      process.stdout.write(`  提示: ${err.message}\n\n`)
+    }
+    process.exit(0)
   }
 
   // 1. 同步与补全模型路由表
