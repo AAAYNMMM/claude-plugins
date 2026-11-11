@@ -1,0 +1,23 @@
+{
+  "name": "agent-gateway",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Claude Code & Claude Desktop 聚合网关插件（支持 WorkBuddy、反重力与直连代理）",
+  "type": "module",
+  "bin": {
+    "agent-gateway": "bin/agent-gateway.mjs"
+  },
+  "scripts": {
+    "build": "node build.mjs",
+    "start": "node dist/server.js serve",
+    "status": "node dist/server.js status",
+    "models": "node dist/server.js models",
+    "doctor": "node dist/server.js doctor"
+  },
+  "engines": {
+    "node": ">=22.18.0"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0"
+  }
+}

@@ -1,7 +1,0 @@
-{
-  "name": "workbuddy-for-claude",
-  "version": "0.1.0",
-  "description": "把本机已登录的 WorkBuddy 模型接入 Claude Code，并与 DeepSeek 放在同一个模型列表里无缝切换。",
-  "author": { "name": "AAAYNMMM" },
-  "license": "MIT"
-}

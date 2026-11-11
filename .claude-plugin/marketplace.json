@@ -10,14 +10,9 @@
       "description": "每次会话开始时注入一条规则：Bash 命令的说明必须写清做法、影响和风险。"
     },
     {
-      "name": "workbuddy-for-claude",
-      "source": "./workbuddy-for-claude",
-      "description": "把本机已登录的 WorkBuddy 模型接入 Claude Code，并与 DeepSeek 放在同一个模型列表里无缝切换。"
-    },
-    {
-      "name": "ds-credits",
-      "source": "./ds-credits",
-      "description": "在桌面版底部状态栏显示 DeepSeek 余额（读取 claude-workbuddy 网关写入的余额文件，不接触 API Key）。"
+      "name": "agent-gateway",
+      "source": "./agent-gateway",
+      "description": "多上游模型聚合翻译网关插件：将 WorkBuddy 与反重力 (Antigravity/Gemini) 模型接入 Claude 桌面端与 CLI，支持原本代理与网关的双向无损切换。"
     }
   ]
 }

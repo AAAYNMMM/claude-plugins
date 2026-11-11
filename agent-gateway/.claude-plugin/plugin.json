@@ -1,0 +1,7 @@
+{
+  "name": "agent-gateway",
+  "version": "0.1.0",
+  "description": "多上游模型聚合翻译网关插件：支持 WorkBuddy、反重力 (Antigravity/Gemini) 与直连代理，提供 Claude 桌面端与 CLI 的无缝接入与双向无损切换。",
+  "author": { "name": "AAAYNMMM" },
+  "license": "MIT"
+}
