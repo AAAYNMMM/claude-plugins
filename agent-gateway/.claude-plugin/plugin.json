@@ -5,13 +5,10 @@
   "author": { "name": "AAAYNMMM" },
   "license": "MIT",
   "commands": [
-    "./commands/gateway-on.md",
-    "./commands/gateway-off.md",
-    "./commands/gateway-status.md",
-    "./commands/gateway-models.md",
-    "./commands/gateway-sync.md"
-  ],
-  "skills": [
-    "./skills/agent-gateway"
+    "./commands/on.md",
+    "./commands/off.md",
+    "./commands/status.md",
+    "./commands/models.md",
+    "./commands/sync.md"
   ]
 }
