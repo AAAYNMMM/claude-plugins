@@ -136,14 +136,25 @@ export class AntigravityModule implements GatewayModule {
           model: request.model,
           stop_reason: null,
           stop_sequence: null,
-          usage: { input_tokens: 100, output_tokens: 0 },
+          usage: { input_tokens: 0, output_tokens: 0 },
         },
       })
 
       let currentBlockIndex = -1
-      let inTextBlock = false
-      let stopReason: 'end_turn' | 'tool_use' = 'end_turn'
+      let activeBlock: 'none' | 'thinking' | 'text' = 'none'
+      let stopReason: 'end_turn' | 'tool_use' | 'max_tokens' = 'end_turn'
+      let totalInputTokens = 0
       let totalOutputTokens = 0
+
+      const closeActiveBlock = () => {
+        if (activeBlock !== 'none') {
+          sendSse('content_block_stop', {
+            type: 'content_block_stop',
+            index: currentBlockIndex,
+          })
+          activeBlock = 'none'
+        }
+      }
 
       const reader = upstreamRes.body?.getReader()
       const decoder = new TextDecoder('utf8')
@@ -217,36 +228,74 @@ export class AntigravityModule implements GatewayModule {
               const candidate = resp.candidates?.[0]
               const parts = candidate?.content?.parts
 
+              // 记录精确 Token 统计
+              if (resp.usageMetadata) {
+                if (typeof resp.usageMetadata.promptTokenCount === 'number') {
+                  totalInputTokens = resp.usageMetadata.promptTokenCount
+                }
+                const candTok = resp.usageMetadata.candidatesTokenCount ?? 0
+                const thoughtTok = resp.usageMetadata.thoughtsTokenCount ?? 0
+                if (candTok + thoughtTok > 0) {
+                  totalOutputTokens = candTok + thoughtTok
+                }
+              }
+
+              // 映射结束原因
+              if (candidate?.finishReason === 'MAX_TOKENS' && stopReason !== 'tool_use') {
+                stopReason = 'max_tokens'
+              }
+
               if (Array.isArray(parts)) {
                 for (const part of parts) {
-                  // 1. 文本内容块
+                  // 1. Thinking 思考内容块 vs 正式 Text 文本内容块
                   if (typeof part.text === 'string' && part.text) {
-                    if (!inTextBlock) {
-                      currentBlockIndex++
-                      sendSse('content_block_start', {
-                        type: 'content_block_start',
+                    if (part.thought === true) {
+                      if (activeBlock !== 'thinking') {
+                        closeActiveBlock()
+                        currentBlockIndex++
+                        sendSse('content_block_start', {
+                          type: 'content_block_start',
+                          index: currentBlockIndex,
+                          content_block: { type: 'thinking', thinking: '' },
+                        })
+                        activeBlock = 'thinking'
+                      }
+                      totalOutputTokens += Math.ceil(part.text.length / 3)
+                      sendSse('content_block_delta', {
+                        type: 'content_block_delta',
                         index: currentBlockIndex,
-                        content_block: { type: 'text', text: '' },
+                        delta: { type: 'thinking_delta', thinking: part.text },
                       })
-                      inTextBlock = true
+                      if (typeof part.thoughtSignature === 'string' && part.thoughtSignature) {
+                        sendSse('content_block_delta', {
+                          type: 'content_block_delta',
+                          index: currentBlockIndex,
+                          delta: { type: 'signature_delta', signature: part.thoughtSignature },
+                        })
+                      }
+                    } else {
+                      if (activeBlock !== 'text') {
+                        closeActiveBlock()
+                        currentBlockIndex++
+                        sendSse('content_block_start', {
+                          type: 'content_block_start',
+                          index: currentBlockIndex,
+                          content_block: { type: 'text', text: '' },
+                        })
+                        activeBlock = 'text'
+                      }
+                      totalOutputTokens += Math.ceil(part.text.length / 3)
+                      sendSse('content_block_delta', {
+                        type: 'content_block_delta',
+                        index: currentBlockIndex,
+                        delta: { type: 'text_delta', text: part.text },
+                      })
                     }
-                    totalOutputTokens += Math.ceil(part.text.length / 3)
-                    sendSse('content_block_delta', {
-                      type: 'content_block_delta',
-                      index: currentBlockIndex,
-                      delta: { type: 'text_delta', text: part.text },
-                    })
                   }
 
                   // 2. 函数调用块 (Tool Use)
                   if (part.functionCall && typeof part.functionCall === 'object') {
-                    if (inTextBlock) {
-                      sendSse('content_block_stop', {
-                        type: 'content_block_stop',
-                        index: currentBlockIndex,
-                      })
-                      inTextBlock = false
-                    }
+                    closeActiveBlock()
 
                     stopReason = 'tool_use'
                     currentBlockIndex++
@@ -286,19 +335,17 @@ export class AntigravityModule implements GatewayModule {
         }
       }
 
-      // 如果有尚未关闭的文本块，在此闭合
-      if (inTextBlock) {
-        sendSse('content_block_stop', {
-          type: 'content_block_stop',
-          index: currentBlockIndex,
-        })
-      }
+      // 如果有尚未关闭的内容块，在此闭合
+      closeActiveBlock()
 
       // 4. message_delta & message_stop
       sendSse('message_delta', {
         type: 'message_delta',
         delta: { stop_reason: stopReason, stop_sequence: null },
-        usage: { output_tokens: totalOutputTokens },
+        usage: {
+          ...(totalInputTokens > 0 ? { input_tokens: totalInputTokens } : {}),
+          output_tokens: totalOutputTokens,
+        },
       })
 
       sendSse('message_stop', { type: 'message_stop' })
@@ -311,11 +358,20 @@ export class AntigravityModule implements GatewayModule {
       const parts = candidate?.content?.parts ?? []
 
       const content: Array<Record<string, unknown>> = []
-      let stopReason: 'end_turn' | 'tool_use' = 'end_turn'
+      let stopReason: 'end_turn' | 'tool_use' | 'max_tokens' =
+        candidate?.finishReason === 'MAX_TOKENS' ? 'max_tokens' : 'end_turn'
 
       for (const part of parts) {
         if (typeof part.text === 'string' && part.text) {
-          content.push({ type: 'text', text: part.text })
+          if (part.thought === true) {
+            content.push({
+              type: 'thinking',
+              thinking: part.text,
+              ...(part.thoughtSignature ? { signature: part.thoughtSignature } : {}),
+            })
+          } else {
+            content.push({ type: 'text', text: part.text })
+          }
         }
         if (part.functionCall && typeof part.functionCall === 'object') {
           stopReason = 'tool_use'
@@ -327,6 +383,11 @@ export class AntigravityModule implements GatewayModule {
           })
         }
       }
+
+      const usageMeta = resp.usageMetadata ?? {}
+      const inputTokens = typeof usageMeta.promptTokenCount === 'number' ? usageMeta.promptTokenCount : 0
+      const outputTokens =
+        (usageMeta.candidatesTokenCount ?? 0) + (usageMeta.thoughtsTokenCount ?? 0) || 50
 
       res.statusCode = 200
       res.setHeader('Content-Type', 'application/json')
@@ -340,8 +401,8 @@ export class AntigravityModule implements GatewayModule {
           stop_reason: stopReason,
           stop_sequence: null,
           usage: {
-            input_tokens: 100,
-            output_tokens: 50,
+            input_tokens: inputTokens,
+            output_tokens: outputTokens,
           },
         })
       )

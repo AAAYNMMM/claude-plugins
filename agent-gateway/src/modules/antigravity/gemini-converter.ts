@@ -10,6 +10,10 @@ import type {
 
 export interface GeminiPart {
   text?: string
+  inlineData?: {
+    mimeType: string
+    data: string
+  }
   functionCall?: {
     name: string
     args: Record<string, unknown>
@@ -18,7 +22,8 @@ export interface GeminiPart {
     name: string
     response: Record<string, unknown>
   }
-  thought?: string
+  thought?: boolean | string
+  thoughtSignature?: string
 }
 
 export interface GeminiContent {
@@ -55,6 +60,19 @@ export interface GeminiRequest {
 export function cleanSchemaForGemini(schema: any): Record<string, unknown> {
   if (!schema || typeof schema !== 'object') {
     return { type: 'object', properties: {} }
+  }
+
+  // 若出现 anyOf / oneOf（常见于可选类型 string | null 或联合类型），优先提取首个有效非 null 分支并保留说明
+  if (Array.isArray(schema.anyOf) || Array.isArray(schema.oneOf)) {
+    const branches = (schema.anyOf ?? schema.oneOf) as any[]
+    const nonNull = branches.find((b) => b && typeof b === 'object' && b.type !== 'null') ?? branches[0]
+    if (nonNull && typeof nonNull === 'object') {
+      const merged = {
+        ...nonNull,
+        ...(schema.description && !nonNull.description ? { description: schema.description } : {}),
+      }
+      return cleanSchemaForGemini(merged)
+    }
   }
 
   const cleaned: Record<string, unknown> = {}
@@ -155,17 +173,27 @@ export function toGeminiRequest(req: AnthropicRequest): GeminiRequest {
     }
   }
 
-  // 2. 对话历史转换
+  // 2. 对话历史转换（支持图片多模态，并按 Gemini 规范合并相邻同 role 消息）
   for (const msg of req.messages) {
     const role: 'user' | 'model' = msg.role === 'assistant' ? 'model' : 'user'
     const parts: GeminiPart[] = []
 
     if (typeof msg.content === 'string') {
-      parts.push({ text: msg.content })
+      if (msg.content) parts.push({ text: msg.content })
     } else if (Array.isArray(msg.content)) {
       for (const part of msg.content) {
         if (part.type === 'text' && typeof (part as any).text === 'string') {
-          parts.push({ text: (part as any).text })
+          if ((part as any).text) parts.push({ text: (part as any).text })
+        } else if (part.type === 'image' && (part as any).source) {
+          const src = (part as any).source
+          if (src.type === 'base64' && typeof src.data === 'string' && src.data) {
+            parts.push({
+              inlineData: {
+                mimeType: src.media_type || 'image/png',
+                data: src.data,
+              },
+            })
+          }
         } else if (part.type === 'tool_use') {
           parts.push({
             functionCall: {
@@ -178,6 +206,7 @@ export function toGeminiRequest(req: AnthropicRequest): GeminiRequest {
           const functionName = toolIdToName.get(toolUseId) || 'tool_result'
           let output: Record<string, unknown> = {}
           const c = (part as any).content
+          const nestedImages: GeminiPart[] = []
           if (typeof c === 'string') {
             try {
               output = JSON.parse(c)
@@ -185,7 +214,19 @@ export function toGeminiRequest(req: AnthropicRequest): GeminiRequest {
               output = { result: c }
             }
           } else if (Array.isArray(c)) {
-            output = { result: c.map(item => item.text ?? '').join('\n') }
+            const textParts: string[] = []
+            for (const item of c) {
+              if (item.type === 'text' && item.text) textParts.push(item.text)
+              else if (item.type === 'image' && item.source?.type === 'base64' && item.source.data) {
+                nestedImages.push({
+                  inlineData: {
+                    mimeType: item.source.media_type || 'image/png',
+                    data: item.source.data,
+                  },
+                })
+              }
+            }
+            output = { result: textParts.join('\n') }
           } else if (c && typeof c === 'object') {
             output = c
           }
@@ -196,12 +237,20 @@ export function toGeminiRequest(req: AnthropicRequest): GeminiRequest {
               response: output,
             },
           })
+          for (const imgPart of nestedImages) {
+            parts.push(imgPart)
+          }
         }
       }
     }
 
     if (parts.length > 0) {
-      contents.push({ role, parts })
+      const last = contents[contents.length - 1]
+      if (last && last.role === role) {
+        last.parts.push(...parts)
+      } else {
+        contents.push({ role, parts })
+      }
     }
   }
 

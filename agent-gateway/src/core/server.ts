@@ -51,9 +51,15 @@ export function createGatewayServer(options: ServerOptions): {
       return
     }
 
-    // CORS 支持
+    // CORS 支持：完整放行桌面端 Electron / Stainless SDK 所需请求头
     res.setHeader('Access-Control-Allow-Origin', origin ?? '*')
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, x-api-key, anthropic-version')
+    const reqHeaders = req.headers['access-control-request-headers']
+    res.setHeader(
+      'Access-Control-Allow-Headers',
+      typeof reqHeaders === 'string' && reqHeaders
+        ? reqHeaders
+        : 'Content-Type, Authorization, x-api-key, anthropic-version, anthropic-beta, anthropic-dangerous-direct-browser-access, x-app, x-stainless-lang, x-stainless-package-version, x-stainless-os, x-stainless-arch, x-stainless-runtime, x-stainless-runtime-version'
+    )
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
 
     if (req.method === 'OPTIONS') {
@@ -121,6 +127,44 @@ export function createGatewayServer(options: ServerOptions): {
       }
     }
 
+    // 4.5. Token Counting API: POST /v1/messages/count_tokens（桌面端上下文百分比统计所需）
+    if (path === '/v1/messages/count_tokens' && req.method === 'POST') {
+      try {
+        const rawBody = await readBody(req)
+        const parsed = JSON.parse(rawBody) as AnthropicRequest
+        let chars = 0
+        if (typeof parsed.system === 'string') chars += parsed.system.length
+        else if (Array.isArray(parsed.system)) {
+          for (const s of parsed.system) chars += (s.text ?? '').length
+        }
+        if (Array.isArray(parsed.messages)) {
+          for (const m of parsed.messages) {
+            if (typeof m.content === 'string') chars += m.content.length
+            else if (Array.isArray(m.content)) {
+              for (const p of m.content as any[]) {
+                if (p.text) chars += p.text.length
+                else if (p.thinking) chars += p.thinking.length
+                else if (p.input) chars += JSON.stringify(p.input).length
+                else if (typeof p.content === 'string') chars += p.content.length
+                else if (Array.isArray(p.content)) chars += JSON.stringify(p.content).length
+                else if (p.type === 'image') chars += 1600
+              }
+            }
+          }
+        }
+        if (Array.isArray(parsed.tools)) chars += JSON.stringify(parsed.tools).length
+        const inputTokens = Math.max(1, Math.ceil(chars / 3))
+        res.statusCode = 200
+        res.setHeader('Content-Type', 'application/json')
+        res.end(JSON.stringify({ input_tokens: inputTokens }))
+      } catch {
+        res.statusCode = 400
+        res.setHeader('Content-Type', 'application/json')
+        res.end(JSON.stringify(errorPayload('invalid_request_error', '无效的 count_tokens 请求体')))
+      }
+      return
+    }
+
     // 5. 核心对话端点 POST /v1/messages
     if (path === '/v1/messages' && req.method === 'POST') {
       let rawBody = ''
@@ -172,7 +216,7 @@ export function createGatewayServer(options: ServerOptions): {
         }
       }
 
-      // 未命中已知路由：智能回退
+      // 未命中已知路由：智能回退（绝不把陌生的 claude-* 直接透传给不支持它的下游）
       if (reqModel.includes('antigravity') || reqModel.includes('gemini')) {
         const agy = host.getAntigravityModule()
         log(`未配置路由，回退到反重力模块: "${reqModel}"`)
@@ -187,15 +231,32 @@ export function createGatewayServer(options: ServerOptions): {
         return
       }
 
-      // 默认回退 WorkBuddy
-      const wb = host.getWorkBuddyModule()
-      log(`未配置路由，默认走 WorkBuddy: "${reqModel}"`)
-      await wb.handleRequest(parsed, res, reqContext)
+      // 若是后台发出的未登记 claude-* 请求（例如标题生成/摘要模型），智能映射到已登记的轻量或首条可用路由
+      const routeValues = Object.values(config.routes)
+      const fallbackRoute =
+        (reqModel.includes('haiku')
+          ? routeValues.find((r) => r.targetModel?.includes('flash') || r.label?.includes('Flash'))
+          : undefined) ?? routeValues[0]
+
+      if (fallbackRoute) {
+        const mod = host.getModule(fallbackRoute.module)
+        if (mod) {
+          log(`未命中路由 "${reqModel}"，智能降级至 [${mod.name}] -> ${fallbackRoute.targetModel}`)
+          await mod.handleRequest(parsed, res, reqContext, fallbackRoute.targetModel)
+          return
+        }
+      }
+
+      // 终极兜底
+      const agy = host.getAntigravityModule()
+      log(`无可用路由，终极兜底至反重力: "${reqModel}"`)
+      await agy.handleRequest(parsed, res, reqContext)
       return
     }
 
     res.statusCode = 404
-    res.end('Not Found')
+    res.setHeader('Content-Type', 'application/json')
+    res.end(JSON.stringify(errorPayload('not_found_error', `不支持的路径: ${path}`)))
   })
 
   return {

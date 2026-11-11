@@ -42,7 +42,10 @@ function killPort43119() {
 
 function killExistingDaemons() {
   try {
-    execSync('wmic process where "name=\'wscript.exe\' and commandline like \'%Gateway%\'" call terminate', { stdio: 'ignore' })
+    execSync(
+      'powershell -NoProfile -Command "Get-CimInstance Win32_Process -Filter \\"Name=\'wscript.exe\'\\" | Where-Object { $_.CommandLine -like \'*Gateway*\' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }"',
+      { stdio: 'ignore' }
+    )
   } catch {}
   killPort43119()
 }

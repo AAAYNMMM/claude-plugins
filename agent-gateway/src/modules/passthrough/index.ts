@@ -75,7 +75,7 @@ export class PassthroughModule implements GatewayModule {
 
     res.statusCode = upstreamRes.status
     for (const [key, value] of upstreamRes.headers.entries()) {
-      if (!/content-encoding|transfer-encoding|connection/i.test(key)) {
+      if (!/content-encoding|content-length|transfer-encoding|connection/i.test(key)) {
         res.setHeader(key, value)
       }
     }
