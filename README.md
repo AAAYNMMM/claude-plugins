@@ -7,5 +7,4 @@ Claude Code 插件市场仓库。安装与维护说明见 [AGENTS.md](./AGENTS.m
 | 插件 | 作用 |
 |---|---|
 | [bash-describe](./bash-describe) | 每次会话开始时注入规则：Bash 命令的说明要写清做法、影响、风险 |
-| [workbuddy-for-claude](./workbuddy-for-claude) | 本机 WorkBuddy 模型接入 Claude Code，与 DeepSeek 同列表无缝切换 |
-| [ds-credits](./ds-credits) | 桌面版底部状态栏显示 DeepSeek 余额（读本地结果文件，不接触 API Key） |
+| [agent-gateway](./agent-gateway) | 多模型聚合翻译网关：把 WorkBuddy 与反重力 (Antigravity/Gemini) 模型接入 Claude 桌面端与 CLI，支持原本配置与网关的双向无损隔离切换 |
