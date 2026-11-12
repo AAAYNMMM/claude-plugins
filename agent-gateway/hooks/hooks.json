@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node -e \"try{fetch('http://127.0.0.1:43119/v1/gateway/sync',{signal:AbortSignal.timeout(1500)}).catch(()=>{})}catch(e){}\""
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -12,6 +12,7 @@ export interface ServerOptions {
   config: GatewayConfig
   host: ModuleHost
   log: (msg: string) => void
+  onSyncRequest?: () => Promise<Record<string, RouteConfig>>
 }
 
 const BODY_LIMIT = 64 * 1024 * 1024
@@ -98,6 +99,28 @@ export function createGatewayServer(options: ServerOptions): {
       res.setHeader('Content-Type', 'application/json')
       res.end(JSON.stringify({ data: models }))
       return
+    }
+
+    // 3.5. 实时模型同步端点: 供启动/重启/会话 Hook 实时静默更新
+    if ((path === '/v1/gateway/sync' || path === '/sync') && (req.method === 'GET' || req.method === 'POST')) {
+      try {
+        if (options.onSyncRequest) {
+          const routes = await options.onSyncRequest()
+          res.statusCode = 200
+          res.setHeader('Content-Type', 'application/json')
+          res.end(JSON.stringify({ ok: true, count: Object.keys(routes).length, routes }))
+          return
+        }
+        res.statusCode = 200
+        res.setHeader('Content-Type', 'application/json')
+        res.end(JSON.stringify({ ok: true, count: Object.keys(config.routes).length }))
+        return
+      } catch (err: any) {
+        res.statusCode = 500
+        res.setHeader('Content-Type', 'application/json')
+        res.end(JSON.stringify({ ok: false, error: err.message }))
+        return
+      }
     }
 
     // 4. 鉴权提取
