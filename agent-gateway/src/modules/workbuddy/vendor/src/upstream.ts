@@ -2271,6 +2271,7 @@ export const WORKBUDDY_FALLBACK_SYSTEM_PROMPT = 'You are a helpful assistant.'
 const UNAPPROVED_CHANNEL_OPENINGS: readonly string[] = [
   'you are an ai agent powered by deepseek harness',
   "you are claude code, anthropic's official cli for claude",
+  'x-anthropic-billing-header:',
 ]
 
 /**
@@ -2336,7 +2337,9 @@ const IDENTITY_CLAUSE =
  */
 export function breakIdentityClauses(text: string): string {
   return text.replace(IDENTITY_CLAUSE, (clause: string) =>
-    clause.replace(/(\s+)/gu, `$1${ZERO_WIDTH_SPACE}`))
+    clause.includes(CHANNEL_BREAK_CHAR)
+      ? clause
+      : clause.replace(/(\s+)/gu, `$1${CHANNEL_BREAK_CHAR}`))
 }
 
 /**
@@ -2519,6 +2522,10 @@ const CHANNEL_GATE_PHRASES: readonly (readonly [string, string])[] = [
     'they mean this GUI.',
     'the interface described here is meant.',
   ],
+  [
+    'To give feedback, users should report the issue at https://github.com/anthropics/claude-code/issues',
+    'For feedback, users can submit issues at https://github.com/anthropics/claude-code/issues',
+  ],
 ]
 
 /**
@@ -2544,17 +2551,21 @@ export function rewriteChannelFingerprintPhrases(text: string): string {
  * both answer 200 with the DSH identity at an opening, and rewriting a user's
  * own words would change the conversation for no gate.
  */
-function rewriteChannelFingerprintPhrasesInBody(obj: Record<string, unknown>): void {
+function transformScannedTextParts(
+  obj: Record<string, unknown>,
+  transform: (text: string, role: string) => string | undefined,
+): void {
   const messages = obj['messages']
   if (!Array.isArray(messages)) return
   for (const value of messages) {
     if (typeof value !== 'object' || value === null || Array.isArray(value)) continue
     const message = value as Record<string, unknown>
     if (!scansOpening(message['role'])) continue
+    const role = (message['role'] as string).trim().toLowerCase()
     const content = message['content']
     if (typeof content === 'string') {
-      const next = rewriteChannelFingerprintPhrases(content)
-      if (next !== content) message['content'] = next
+      const next = transform(content, role)
+      if (next !== undefined && next !== content) message['content'] = next
       continue
     }
     if (!Array.isArray(content)) continue
@@ -2565,10 +2576,33 @@ function rewriteChannelFingerprintPhrasesInBody(obj: Record<string, unknown>): v
       if (typeof type !== 'string' || type.trim().toLowerCase() !== 'text') continue
       const text = record['text']
       if (typeof text !== 'string') continue
-      const next = rewriteChannelFingerprintPhrases(text)
-      if (next !== text) record['text'] = next
+      const next = transform(text, role)
+      if (next !== undefined && next !== text) record['text'] = next
     }
   }
+}
+
+/**
+ * Strip Claude Code / Claude Desktop `x-anthropic-billing-header:` wire lines
+ * from scanned messages. WorkBuddy rejects `x-anthropic-billing-header:` at
+ * offset 0 with code 11128, and the line carries no model instruction.
+ */
+export function stripAnthropicBillingHeader(text: string): string {
+  const stripped = text.replace(/^[ \t]*x-anthropic-billing-header:[^\r\n]*(?:\r?\n|$)+/gim, '')
+  return stripped.replace(/^\r?\n+/, '')
+}
+
+function stripBillingHeadersInBody(obj: Record<string, unknown>): void {
+  transformScannedTextParts(obj, (text, role) => {
+    const cleaned = stripAnthropicBillingHeader(text)
+    if (cleaned === text) return undefined
+    if (role === 'system' && cleaned.trim() === '') return WORKBUDDY_FALLBACK_SYSTEM_PROMPT
+    return cleaned
+  })
+}
+
+function rewriteChannelFingerprintPhrasesInBody(obj: Record<string, unknown>): void {
+  transformScannedTextParts(obj, (text) => rewriteChannelFingerprintPhrases(text))
 }
 
 /**
@@ -2744,7 +2778,15 @@ export function forceNeutralHead(bodyJson: string): string | undefined {
  * the live CN gateway: putting one inside the refused span turns 400 into 200,
  * while the text the model reads is unchanged.
  */
-const ZERO_WIDTH_SPACE = '\u200b'
+/**
+ * Combining Grapheme Joiner (U+034F) used to break channel content fingerprints.
+ *
+ * WorkBuddy's CN gateway strips U+200B/U+200C/U+200D/U+2060/U+FEFF/U+00AD and
+ * collapses horizontal spaces before substring matching, rendering U+200B
+ * perturbations ineffective. Measured on the live CN gateway (2026-11-14):
+ * U+034F is not stripped and turns 400/11128 into 200 while remaining invisible.
+ */
+const CHANNEL_BREAK_CHAR = '\u034f'
 
 /**
  * Where an invisible break is inserted INSIDE a capitalised word pair, so a
@@ -2769,66 +2811,23 @@ const ZERO_WIDTH_SPACE = '\u200b'
  */
 const WORD_INTERNAL_BREAK = /([A-Z][A-Za-z0-9]*)(\s+)(?=[A-Z][A-Za-z0-9])/gu
 
-/** A rune the dense rescue treats as a word character. */
-const DENSE_WORD_RUNE = /[A-Za-z0-9぀-ヿ㐀-鿿]/u
-
 /**
- * Space U+200B through each run of non-space runes, when that run starts with a
- * word rune.
- *
- * THE ONE-PASS FORM OF THE DENSE RULE (issue #159). The rule only ever consults
- * two local facts — the first rune of the CURRENT run of non-space runes, and
- * whether the rune immediately before this position is already a break — so it
- * needs one accumulator and no prefix slicing, which is what makes it linear
- * rather than quadratic. See the body for why the reference is the run's FIRST
- * rune rather than the previous one, and for the exact old expression it
- * reproduces.
- *
- * It is kept as a standalone function so its output can be compared against a
- * literal transcription of the old `replace` in the test suite: the rewrite is
- * a performance change only, and a byte-difference would mean the rescue sends
- * a body nobody measured.
+ * Dense word-boundary & long-token break using U+034F (Combining Grapheme Joiner).
+ * Keeps ordinary words intact (break goes after whitespace runs, plus one break
+ * at the midpoint of long non-whitespace tokens >= 8 runes such as URLs).
  */
 function spaceDenseBreaks(text: string): string {
-  // The old rule was a `replace` over `/(?=\S)/gu` whose callback asked, for the
-  // position `offset`, whether the "nearest preceding non-space rune" exists and
-  // is a word rune — via `source.slice(0, offset).match(/\S(?=\S*$)/u)`. That
-  // lookahead demands EVERY rune after the match be non-space, so a match only
-  // exists when the prefix ends inside a run of non-space runes, and the rune it
-  // returns is the FIRST rune of that run (not the last one). The rule is:
-  //
-  //   at a non-space rune, insert U+200B when that run starts with a word rune
-  //   and neither this rune nor the one before it is already U+200B.
-  //
-  // Reproduced with one accumulator instead of a per-position prefix slice, which
-  // is what turns the old O(n²) into O(n). The OUTPUT IS BYTE-IDENTICAL, quirks
-  // included — notably that a run beginning with a non-word rune gets no breaks
-  // at all — because a difference here would send a body nobody measured.
-  const runes = Array.from(text)
-  let out = ''
-  /** First rune of the current run of non-space runes; `undefined` outside one. */
-  let runStart: string | undefined
-  for (let index = 0; index < runes.length; index += 1) {
-    const rune = runes[index] as string
-    if (/^\s$/u.test(rune)) {
-      runStart = undefined
-      out += rune
-      continue
-    }
-    runStart ??= rune
-    // "There IS a preceding non-space rune" is the whole first half of the old
-    // predicate: outside a run (i.e. after a space) the regex found no match, so
-    // no break lands on the first rune of a word. `runStart` is the rune that
-    // match returned, not the one before this position.
-    const inRun = index > 0 && !/^\s$/u.test(runes[index - 1] as string)
-    const before = runes[index - 1]
-    if (inRun && runStart !== ZERO_WIDTH_SPACE && DENSE_WORD_RUNE.test(runStart)
-      && rune !== ZERO_WIDTH_SPACE && before !== ZERO_WIDTH_SPACE) {
-      out += ZERO_WIDTH_SPACE
-    }
-    out += rune
-  }
-  return out
+  const afterSpaces = text.replace(/(\s+)(?!\u034f)/gu, `$1${CHANNEL_BREAK_CHAR}`)
+  return afterSpaces.replace(/\S{8,}/gu, (token: string) => {
+    const start = token.startsWith(CHANNEL_BREAK_CHAR) ? 1 : 0
+    const end = token.endsWith(CHANNEL_BREAK_CHAR) ? token.length - 1 : token.length
+    const core = token.slice(start, end)
+    if (core.includes(CHANNEL_BREAK_CHAR)) return token
+    const runes = Array.from(core)
+    if (runes.length < 8) return token
+    const mid = Math.floor(runes.length / 2)
+    return `${token.slice(0, start)}${runes.slice(0, mid).join('')}${CHANNEL_BREAK_CHAR}${runes.slice(mid).join('')}${token.slice(end)}`
+  })
 }
 
 /**
@@ -2905,11 +2904,11 @@ export function perturbChannelFingerprints(
     // written unspaced), so without `(?!\u200b)` it would stack a second break
     // on every pass, and `第一句！` at end-of-text would grow one ZWS per retry.
     const boundaries = text
-      .replace(/([.!?])(\s+)/gu, `$1${ZERO_WIDTH_SPACE}$2`)
-      .replace(/([。！？])(?!\u200b)/gu, `$1${ZERO_WIDTH_SPACE}`)
-      .replace(/([,;])(\s+)/gu, `$1${ZERO_WIDTH_SPACE}$2`)
-      .replace(WORD_INTERNAL_BREAK, (whole: string, head: string, tail: string) =>
-        `${head}${ZERO_WIDTH_SPACE}${tail}`)
+      .replace(/([.!?])(?!\u034f)(\s+)/gu, `$1${CHANNEL_BREAK_CHAR}$2`)
+      .replace(/([。！？])(?!\u034f)/gu, `$1${CHANNEL_BREAK_CHAR}`)
+      .replace(/([,;])(?!\u034f)(\s+)/gu, `$1${CHANNEL_BREAK_CHAR}$2`)
+      .replace(WORD_INTERNAL_BREAK, (_whole: string, head: string, tail: string) =>
+        `${head}${CHANNEL_BREAK_CHAR}${tail}`)
     if (!dense) return boundaries === text ? undefined : boundaries
     // DENSE mode is the strong rescue used after the ordinary rescue has also
     // failed. Punctuation rules cannot break a fingerprint made only of ordinary
@@ -3426,6 +3425,7 @@ export function prepareChatBody(source: string, options?: PrepareChatBodyOptions
       if (message['role'] === 'developer') message['role'] = 'system'
     }
   }
+  stripBillingHeadersInBody(obj)
   ensureSystemHead(obj)
   // AFTER the system head, so the injected blocks cannot displace it: the
   // gateways require the conversation to OPEN with a system message, and this

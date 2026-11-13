@@ -42,6 +42,11 @@ import {
 } from '../src/modules/antigravity/models.ts'
 import { PassthroughModule } from '../src/modules/passthrough/index.ts'
 import { WorkBuddyModule } from '../src/modules/workbuddy/index.ts'
+import {
+  perturbChannelFingerprints,
+  prepareChatBody,
+  WORKBUDDY_FALLBACK_SYSTEM_PROMPT,
+} from '../src/modules/workbuddy/vendor/src/upstream.ts'
 
 class MockServerResponse extends EventEmitter {
   statusCode = 200
@@ -967,5 +972,112 @@ describe('P2-3, P2-4 & Claude Desktop Lifecycle', () => {
       globalThis.fetch = origFetch
       invalidateAntigravityModelCaches()
     }
+  })
+})
+
+describe('WorkBuddy channel_reject & reasoning_content fixes', () => {
+  it('strips x-anthropic-billing-header and rewrites Claude Code feedback phrase in prepareChatBody', () => {
+    const raw = JSON.stringify({
+      model: 'hy4free',
+      messages: [
+        {
+          role: 'system',
+          content:
+            'x-anthropic-billing-header: cc_version=2.1.321.cf7; cc_entrypoint=claude-desktop-3p;\n\n' +
+            'You are a Claude agent.\n\n' +
+            'If the user asks for help or wants to give feedback inform them of the following:\n' +
+            '- To give feedback, users should report the issue at https://github.com/anthropics/claude-code/issues',
+        },
+        { role: 'user', content: 'hi' },
+      ],
+    })
+    const prepared = JSON.parse(prepareChatBody(raw))
+    const sys = prepared.messages[0].content as string
+    assert.equal(sys.includes('x-anthropic-billing-header:'), false)
+    assert.equal(sys.startsWith('You are a Claude agent.'), true)
+    assert.equal(
+      sys.includes('To give feedback, users should report the issue at https://github.com/anthropics/claude-code/issues'),
+      false
+    )
+    assert.equal(sys.includes('https://github.com/anthropics/claude-code/issues'), true)
+
+    // Stripping billing-header-only system message falls back to WORKBUDDY_FALLBACK_SYSTEM_PROMPT
+    const onlyBilling = JSON.parse(
+      prepareChatBody(
+        JSON.stringify({
+          model: 'hy4free',
+          messages: [
+            { role: 'system', content: 'x-anthropic-billing-header: cc_version=2.1.321.cf7;\n' },
+            { role: 'user', content: 'hi' },
+          ],
+        })
+      )
+    )
+    assert.equal(onlyBilling.messages[0].content, WORKBUDDY_FALLBACK_SYSTEM_PROMPT)
+  })
+
+  it('uses U+034F (CGJ) idempotently in sparse and dense perturbChannelFingerprints', () => {
+    const src = JSON.stringify({
+      model: 'hy4free',
+      messages: [
+        { role: 'system', content: 'First sentence. Second sentence, clause; https://example.com/some-long-path' },
+        { role: 'user', content: 'Keep user text untouched.' },
+      ],
+    })
+    const sparse1 = perturbChannelFingerprints(src, false)
+    assert.ok(sparse1 && sparse1.includes('\u034f'))
+    assert.equal(sparse1.includes('\u200b'), false)
+    // User message remains untouched
+    assert.equal(JSON.parse(sparse1).messages[1].content, 'Keep user text untouched.')
+
+    const dense1 = perturbChannelFingerprints(src, true)
+    assert.ok(dense1)
+    const denseSys = JSON.parse(dense1).messages[0].content as string
+    assert.equal(denseSys.includes(' \u034f'), true)
+    assert.equal(denseSys.includes('\u200b'), false)
+    // Idempotent on second dense pass
+    assert.equal(perturbChannelFingerprints(dense1, true), undefined)
+  })
+
+  it('maps OpenAI reasoning_content to Anthropic thinking blocks and accepts finish_reason with empty content', async () => {
+    const makeOpenAiSse = (chunks: unknown[]) => {
+      const encoder = new TextEncoder()
+      const payload = chunks.map((c) => `data: ${JSON.stringify(c)}\n\n`).join('') + 'data: [DONE]\n\n'
+      return new ReadableStream<Uint8Array>({
+        start(ctrl) {
+          ctrl.enqueue(encoder.encode(payload))
+          ctrl.close()
+        },
+      })
+    }
+
+    // 1. reasoning_content + content -> thinking block followed by text block
+    const res = new MockServerResponse()
+    await streamAnthropic(
+      makeOpenAiSse([
+        { choices: [{ delta: { reasoning_content: 'Let me think' }, finish_reason: '' }] },
+        { choices: [{ delta: { content: 'Hello!' }, finish_reason: 'stop' }], usage: { prompt_tokens: 10, completion_tokens: 5 } },
+      ]),
+      res as unknown as ServerResponse,
+      'claude-sonnet-5-20',
+      10,
+      () => {}
+    )
+    const sse = res.text()
+    assert.ok(sse.includes('"type":"thinking"'))
+    assert.ok(sse.includes('"type":"thinking_delta","thinking":"Let me think"'))
+    assert.ok(sse.includes('"type":"text_delta","text":"Hello!"'))
+
+    // 2. max_tokens=1 on thinking model: finish_reason="length" with empty content must not throw 502
+    const collected = await collectAnthropic(
+      makeOpenAiSse([
+        { choices: [{ delta: { role: 'assistant', content: '', reasoning_content: '' }, finish_reason: '' }] },
+        { choices: [{ delta: { content: '', reasoning_content: '' }, finish_reason: 'length' }], usage: { prompt_tokens: 54, completion_tokens: 1 } },
+      ]),
+      'claude-sonnet-5-20',
+      54,
+      () => {}
+    )
+    assert.equal(collected.stop_reason, 'max_tokens')
   })
 })

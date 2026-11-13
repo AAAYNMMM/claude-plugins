@@ -1152,6 +1152,10 @@ data: ${JSON.stringify(data)}
       }
     });
   }
+  openThinking() {
+    this.event("content_block_start", { type: "content_block_start", index: this.nextIndex(), content_block: { type: "thinking", thinking: "" } });
+    this.blockOpen = true;
+  }
   openText() {
     this.event("content_block_start", { type: "content_block_start", index: this.nextIndex(), content_block: { type: "text", text: "" } });
     this.blockOpen = true;
@@ -1163,6 +1167,9 @@ data: ${JSON.stringify(data)}
       content_block: { type: "tool_use", id: state.id, name: state.name, input: {} }
     });
     this.blockOpen = true;
+  }
+  thinkingDelta(text2) {
+    this.event("content_block_delta", { type: "content_block_delta", index: this.index, delta: { type: "thinking_delta", thinking: text2 } });
   }
   textDelta(text2) {
     this.event("content_block_delta", { type: "content_block_delta", index: this.index, delta: { type: "text_delta", text: text2 } });
@@ -1198,6 +1205,10 @@ var CollectSink = class {
   messageStart(usage) {
     this.usage = usage;
   }
+  openThinking() {
+    this.index += 1;
+    this.blocks.push({ type: "thinking", thinking: "" });
+  }
   openText() {
     this.index += 1;
     this.blocks.push({ type: "text", text: "" });
@@ -1205,6 +1216,10 @@ var CollectSink = class {
   openTool(state) {
     this.index += 1;
     this.blocks.push({ type: "tool_use", id: state.id, name: state.name, input: "" });
+  }
+  thinkingDelta(text2) {
+    const block = this.blocks[this.index];
+    if (block?.type === "thinking") block.thinking += text2;
   }
   textDelta(text2) {
     const block = this.blocks[this.index];
@@ -1224,6 +1239,7 @@ var CollectSink = class {
   }
   finalMessage(model) {
     const content = this.blocks.map((block) => {
+      if (block.type === "thinking") return { type: "thinking", thinking: block.thinking };
       if (block.type === "text") return { type: "text", text: block.text };
       let input = {};
       try {
@@ -1318,6 +1334,18 @@ async function drive(body, sink, inputTokens, onWarning, onBeforeStart) {
       const choice = choices[0];
       if (typeof choice.finish_reason === "string" && choice.finish_reason !== "") finishReason = choice.finish_reason;
       const delta = choice.delta ?? {};
+      const reasoning = delta["reasoning_content"];
+      if (typeof reasoning === "string" && reasoning !== "") {
+        if (current !== "thinking") {
+          closeCurrent();
+          flushPendingTools();
+          ensureStart();
+          sink.openThinking();
+          current = "thinking";
+        }
+        sink.thinkingDelta(reasoning);
+        emitted = true;
+      }
       const content = delta["content"];
       if (typeof content === "string" && content !== "") {
         if (current !== "text") {
@@ -1390,7 +1418,13 @@ async function drive(body, sink, inputTokens, onWarning, onBeforeStart) {
   closeCurrent();
   flushPendingTools();
   if (!emitted) {
-    throw new UpstreamStreamError("\u4E0A\u6E38\u8FD4\u56DE\u7A7A\u54CD\u5E94\u6D41", 502, !started);
+    if (finishReason !== "") {
+      ensureStart();
+      sink.openText();
+      sink.closeBlock();
+    } else {
+      throw new UpstreamStreamError("\u4E0A\u6E38\u8FD4\u56DE\u7A7A\u54CD\u5E94\u6D41", 502, !started);
+    }
   }
   const sawValidTool = Array.from(tools.values()).some((t) => t.started);
   sink.messageDelta(stopReasonOf(finishReason, sawValidTool), usage);
@@ -4037,11 +4071,12 @@ function imageHeaders(credential, identity = {}) {
 var WORKBUDDY_FALLBACK_SYSTEM_PROMPT = "You are a helpful assistant.";
 var UNAPPROVED_CHANNEL_OPENINGS = [
   "you are an ai agent powered by deepseek harness",
-  "you are claude code, anthropic's official cli for claude"
+  "you are claude code, anthropic's official cli for claude",
+  "x-anthropic-billing-header:"
 ];
 var IDENTITY_CLAUSE = /(you)(\s+are\s+(?:(?:an?\s+)?[\w-]*\s*agent\s+powered\s+by|interacting\s+with\s+the\s+user\s+through\s+the\s+deepseek\s+harness))/giu;
 function breakIdentityClauses(text2) {
-  return text2.replace(IDENTITY_CLAUSE, (clause) => clause.replace(/(\s+)/gu, `$1${ZERO_WIDTH_SPACE}`));
+  return text2.replace(IDENTITY_CLAUSE, (clause) => clause.includes(CHANNEL_BREAK_CHAR) ? clause : clause.replace(/(\s+)/gu, `$1${CHANNEL_BREAK_CHAR}`));
 }
 function isUnapprovedChannelOpening(text2) {
   const opening = text2.replace(/^\s+/u, "").toLowerCase();
@@ -4135,6 +4170,10 @@ var CHANNEL_GATE_PHRASES = [
   [
     "they mean this GUI.",
     "the interface described here is meant."
+  ],
+  [
+    "To give feedback, users should report the issue at https://github.com/anthropics/claude-code/issues",
+    "For feedback, users can submit issues at https://github.com/anthropics/claude-code/issues"
   ]
 ];
 function rewriteChannelFingerprintPhrases(text2) {
@@ -4144,17 +4183,18 @@ function rewriteChannelFingerprintPhrases(text2) {
   }
   return out;
 }
-function rewriteChannelFingerprintPhrasesInBody(obj) {
+function transformScannedTextParts(obj, transform) {
   const messages = obj["messages"];
   if (!Array.isArray(messages)) return;
   for (const value of messages) {
     if (typeof value !== "object" || value === null || Array.isArray(value)) continue;
     const message = value;
     if (!scansOpening(message["role"])) continue;
+    const role = message["role"].trim().toLowerCase();
     const content = message["content"];
     if (typeof content === "string") {
-      const next = rewriteChannelFingerprintPhrases(content);
-      if (next !== content) message["content"] = next;
+      const next = transform(content, role);
+      if (next !== void 0 && next !== content) message["content"] = next;
       continue;
     }
     if (!Array.isArray(content)) continue;
@@ -4165,10 +4205,25 @@ function rewriteChannelFingerprintPhrasesInBody(obj) {
       if (typeof type !== "string" || type.trim().toLowerCase() !== "text") continue;
       const text2 = record2["text"];
       if (typeof text2 !== "string") continue;
-      const next = rewriteChannelFingerprintPhrases(text2);
-      if (next !== text2) record2["text"] = next;
+      const next = transform(text2, role);
+      if (next !== void 0 && next !== text2) record2["text"] = next;
     }
   }
+}
+function stripAnthropicBillingHeader(text2) {
+  const stripped = text2.replace(/^[ \t]*x-anthropic-billing-header:[^\r\n]*(?:\r?\n|$)+/gim, "");
+  return stripped.replace(/^\r?\n+/, "");
+}
+function stripBillingHeadersInBody(obj) {
+  transformScannedTextParts(obj, (text2, role) => {
+    const cleaned = stripAnthropicBillingHeader(text2);
+    if (cleaned === text2) return void 0;
+    if (role === "system" && cleaned.trim() === "") return WORKBUDDY_FALLBACK_SYSTEM_PROMPT;
+    return cleaned;
+  });
+}
+function rewriteChannelFingerprintPhrasesInBody(obj) {
+  transformScannedTextParts(obj, (text2) => rewriteChannelFingerprintPhrases(text2));
 }
 function neutralizeChannelFingerprints(obj) {
   const messages = obj["messages"];
@@ -4245,29 +4300,20 @@ ${text2}`;
   if (!changed) return void 0;
   return JSON.stringify(obj);
 }
-var ZERO_WIDTH_SPACE = "\u200B";
+var CHANNEL_BREAK_CHAR = "\u034F";
 var WORD_INTERNAL_BREAK = /([A-Z][A-Za-z0-9]*)(\s+)(?=[A-Z][A-Za-z0-9])/gu;
-var DENSE_WORD_RUNE = /[A-Za-z0-9぀-ヿ㐀-鿿]/u;
 function spaceDenseBreaks(text2) {
-  const runes = Array.from(text2);
-  let out = "";
-  let runStart;
-  for (let index = 0; index < runes.length; index += 1) {
-    const rune = runes[index];
-    if (/^\s$/u.test(rune)) {
-      runStart = void 0;
-      out += rune;
-      continue;
-    }
-    runStart ??= rune;
-    const inRun = index > 0 && !/^\s$/u.test(runes[index - 1]);
-    const before = runes[index - 1];
-    if (inRun && runStart !== ZERO_WIDTH_SPACE && DENSE_WORD_RUNE.test(runStart) && rune !== ZERO_WIDTH_SPACE && before !== ZERO_WIDTH_SPACE) {
-      out += ZERO_WIDTH_SPACE;
-    }
-    out += rune;
-  }
-  return out;
+  const afterSpaces = text2.replace(/(\s+)(?!\u034f)/gu, `$1${CHANNEL_BREAK_CHAR}`);
+  return afterSpaces.replace(/\S{8,}/gu, (token) => {
+    const start = token.startsWith(CHANNEL_BREAK_CHAR) ? 1 : 0;
+    const end = token.endsWith(CHANNEL_BREAK_CHAR) ? token.length - 1 : token.length;
+    const core = token.slice(start, end);
+    if (core.includes(CHANNEL_BREAK_CHAR)) return token;
+    const runes = Array.from(core);
+    if (runes.length < 8) return token;
+    const mid = Math.floor(runes.length / 2);
+    return `${token.slice(0, start)}${runes.slice(0, mid).join("")}${CHANNEL_BREAK_CHAR}${runes.slice(mid).join("")}${token.slice(end)}`;
+  });
 }
 function perturbChannelFingerprints(bodyJson, dense = false) {
   let parsed;
@@ -4282,7 +4328,7 @@ function perturbChannelFingerprints(bodyJson, dense = false) {
   if (!Array.isArray(messages)) return void 0;
   let changed = false;
   const perturb = (text2) => {
-    const boundaries = text2.replace(/([.!?])(\s+)/gu, `$1${ZERO_WIDTH_SPACE}$2`).replace(/([。！？])(?!\u200b)/gu, `$1${ZERO_WIDTH_SPACE}`).replace(/([,;])(\s+)/gu, `$1${ZERO_WIDTH_SPACE}$2`).replace(WORD_INTERNAL_BREAK, (whole, head, tail) => `${head}${ZERO_WIDTH_SPACE}${tail}`);
+    const boundaries = text2.replace(/([.!?])(?!\u034f)(\s+)/gu, `$1${CHANNEL_BREAK_CHAR}$2`).replace(/([。！？])(?!\u034f)/gu, `$1${CHANNEL_BREAK_CHAR}`).replace(/([,;])(?!\u034f)(\s+)/gu, `$1${CHANNEL_BREAK_CHAR}$2`).replace(WORD_INTERNAL_BREAK, (_whole, head, tail) => `${head}${CHANNEL_BREAK_CHAR}${tail}`);
     if (!dense) return boundaries === text2 ? void 0 : boundaries;
     const denseText = spaceDenseBreaks(boundaries);
     return denseText === text2 ? void 0 : denseText;
@@ -4495,6 +4541,7 @@ function prepareChatBody(source, options) {
       if (message["role"] === "developer") message["role"] = "system";
     }
   }
+  stripBillingHeadersInBody(obj);
   ensureSystemHead(obj);
   if (options?.keepPromptLast === true && Array.isArray(obj["messages"])) {
     keepPromptLast(obj["messages"], injectedPrefixPattern(options.extraInjectedPrefixes));

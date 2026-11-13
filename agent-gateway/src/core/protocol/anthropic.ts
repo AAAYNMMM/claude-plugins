@@ -376,8 +376,10 @@ function stopReasonOf(finishReason: string, sawToolCall: boolean): string {
 /** 流式转换的落笔对象；两个实现（SSE 直写、非流式汇总）共用同一套状态机。 */
 interface Sink {
   messageStart(usage: { input_tokens: number; output_tokens: number }): void
+  openThinking(): void
   openText(): void
   openTool(state: ToolCallState): void
+  thinkingDelta(text: string): void
   textDelta(text: string): void
   toolDelta(state: ToolCallState, partial: string): void
   closeBlock(): void
@@ -418,6 +420,11 @@ class SseSink implements Sink {
     })
   }
 
+  openThinking(): void {
+    this.event('content_block_start', { type: 'content_block_start', index: this.nextIndex(), content_block: { type: 'thinking', thinking: '' } })
+    this.blockOpen = true
+  }
+
   openText(): void {
     this.event('content_block_start', { type: 'content_block_start', index: this.nextIndex(), content_block: { type: 'text', text: '' } })
     this.blockOpen = true
@@ -430,6 +437,10 @@ class SseSink implements Sink {
       content_block: { type: 'tool_use', id: state.id, name: state.name, input: {} },
     })
     this.blockOpen = true
+  }
+
+  thinkingDelta(text: string): void {
+    this.event('content_block_delta', { type: 'content_block_delta', index: this.index, delta: { type: 'thinking_delta', thinking: text } })
   }
 
   textDelta(text: string): void {
@@ -468,13 +479,18 @@ class SseSink implements Sink {
 
 /** 非流式响应：把同一套事件累积成一条完整消息。 */
 class CollectSink implements Sink {
-  blocks: ({ type: 'text'; text: string } | { type: 'tool_use'; id: string; name: string; input: string })[] = []
+  blocks: ({ type: 'thinking'; thinking: string } | { type: 'text'; text: string } | { type: 'tool_use'; id: string; name: string; input: string })[] = []
   stopReason = 'end_turn'
   usage = { input_tokens: 0, output_tokens: 0 }
   private index = -1
 
   messageStart(usage: { input_tokens: number; output_tokens: number }): void {
     this.usage = usage
+  }
+
+  openThinking(): void {
+    this.index += 1
+    this.blocks.push({ type: 'thinking', thinking: '' })
   }
 
   openText(): void {
@@ -485,6 +501,11 @@ class CollectSink implements Sink {
   openTool(state: ToolCallState): void {
     this.index += 1
     this.blocks.push({ type: 'tool_use', id: state.id, name: state.name, input: '' })
+  }
+
+  thinkingDelta(text: string): void {
+    const block = this.blocks[this.index]
+    if (block?.type === 'thinking') block.thinking += text
   }
 
   textDelta(text: string): void {
@@ -508,6 +529,7 @@ class CollectSink implements Sink {
 
   finalMessage(model: string): Record<string, unknown> {
     const content = this.blocks.map(block => {
+      if (block.type === 'thinking') return { type: 'thinking', thinking: block.thinking }
       if (block.type === 'text') return { type: 'text', text: block.text }
       let input: unknown = {}
       try {
@@ -544,7 +566,7 @@ async function drive(
   onBeforeStart?: () => void
 ): Promise<void> {
   const tools = new Map<number, ToolCallState & { closed?: boolean }>()
-  let current: 'text' | 'tool' | undefined
+  let current: 'thinking' | 'text' | 'tool' | undefined
   let currentTool: number | undefined
   let finishReason = ''
   const usage = { input_tokens: inputTokens, output_tokens: 0 }
@@ -626,6 +648,20 @@ async function drive(
       if (typeof choice.finish_reason === 'string' && choice.finish_reason !== '') finishReason = choice.finish_reason
       const delta = choice.delta ?? {}
 
+      // 思考增量（例如 WorkBuddy hy4free/hy3 的 reasoning_content）：映射为 Anthropic thinking 块
+      const reasoning = delta['reasoning_content']
+      if (typeof reasoning === 'string' && reasoning !== '') {
+        if (current !== 'thinking') {
+          closeCurrent()
+          flushPendingTools()
+          ensureStart()
+          sink.openThinking()
+          current = 'thinking'
+        }
+        sink.thinkingDelta(reasoning)
+        emitted = true
+      }
+
       // 正文增量：如果当前开的是工具块，先关掉它并冲刷已完成缓存的并行工具块。
       const content = delta['content']
       if (typeof content === 'string' && content !== '') {
@@ -706,7 +742,14 @@ async function drive(
   flushPendingTools()
 
   if (!emitted) {
-    throw new UpstreamStreamError('上游返回空响应流', 502, !started)
+    if (finishReason !== '') {
+      // 上游已返回明确的 finish_reason（如 max_tokens=1 时思考模型耗尽配额未输出正文），按合法空响应收尾而非误报 502
+      ensureStart()
+      sink.openText()
+      sink.closeBlock()
+    } else {
+      throw new UpstreamStreamError('上游返回空响应流', 502, !started)
+    }
   }
 
   const sawValidTool = Array.from(tools.values()).some(t => t.started)
