@@ -8246,10 +8246,11 @@ var antigravityAuth = new AntigravityAuthManager();
 
 // src/modules/antigravity/index.ts
 var MAX_CONCURRENT_REQUESTS = 2;
-var MIN_DISPATCH_GAP_MS = 180;
-var MAX_UPSTREAM_RETRIES = 3;
-var MAX_RETRY_DELAY_MS = 2e4;
-var DEFAULT_RETRY_AFTER_SEC = 15;
+var MIN_DISPATCH_GAP_MS = 250;
+var RETRY_BACKOFF_MS = [2500, 5e3, 9e3, 14e3, 2e4];
+var MAX_UPSTREAM_RETRIES = RETRY_BACKOFF_MS.length;
+var MAX_RETRY_DELAY_MS = 25e3;
+var DEFAULT_RETRY_AFTER_SEC = 30;
 function parseRetryDelayMs(res, errText) {
   const retryAfter = res.headers.get("retry-after");
   if (retryAfter) {
@@ -8292,7 +8293,7 @@ var AntigravityModule = class {
   accountEmail = "";
   inFlight = 0;
   waitQueue = [];
-  lastDispatchAt = 0;
+  nextDispatchAt = 0;
   rateLimitUntil = 0;
   async acquireSlot(signal) {
     if (signal.aborted) {
@@ -8322,13 +8323,12 @@ var AntigravityModule = class {
   }
   async waitDispatchWindow(signal) {
     const now = Date.now();
-    const gapWait = Math.max(0, this.lastDispatchAt + MIN_DISPATCH_GAP_MS - now);
-    const cooldownWait = Math.max(0, this.rateLimitUntil - now);
-    const waitMs = Math.max(gapWait, cooldownWait);
+    const slotAt = Math.max(now, this.nextDispatchAt, this.rateLimitUntil);
+    this.nextDispatchAt = slotAt + MIN_DISPATCH_GAP_MS;
+    const waitMs = slotAt - now;
     if (waitMs > 0) {
       await sleepAbortable(waitMs, signal);
     }
-    this.lastDispatchAt = Date.now();
   }
   async init(context) {
     this.ctx = context;
@@ -8425,7 +8425,8 @@ var AntigravityModule = class {
         const isRetryable = status === 429 || status === 502 || status === 503 || status === 529;
         if (status === 429) {
           const hintedMs = parseRetryDelayMs(upstreamRes, lastErrText);
-          const baseBackoff = 1800 * Math.pow(2, attempt) + Math.floor(Math.random() * 500);
+          const scheduledBase = RETRY_BACKOFF_MS[Math.min(attempt, RETRY_BACKOFF_MS.length - 1)];
+          const baseBackoff = scheduledBase + Math.floor(Math.random() * 500);
           const waitMs = Math.min(hintedMs ?? baseBackoff, MAX_RETRY_DELAY_MS);
           this.rateLimitUntil = Math.max(this.rateLimitUntil, Date.now() + waitMs);
           if (attempt < MAX_UPSTREAM_RETRIES) {

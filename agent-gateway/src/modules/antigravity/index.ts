@@ -31,10 +31,11 @@ import { errorPayload, errorTypeForStatus } from '../../core/protocol/anthropic.
 import { antigravityAuth } from './auth.ts'
 
 const MAX_CONCURRENT_REQUESTS = 2
-const MIN_DISPATCH_GAP_MS = 180
-const MAX_UPSTREAM_RETRIES = 3
-const MAX_RETRY_DELAY_MS = 20_000
-const DEFAULT_RETRY_AFTER_SEC = 15
+const MIN_DISPATCH_GAP_MS = 250
+const RETRY_BACKOFF_MS = [2500, 5000, 9000, 14000, 20000]
+const MAX_UPSTREAM_RETRIES = RETRY_BACKOFF_MS.length
+const MAX_RETRY_DELAY_MS = 25_000
+const DEFAULT_RETRY_AFTER_SEC = 30
 
 /** 从上游响应头或 Google Cloud Code 错误文本中提取建议等待毫秒数 */
 function parseRetryDelayMs(res: Response, errText: string): number | null {
@@ -82,7 +83,7 @@ export class AntigravityModule implements GatewayModule {
   private accountEmail: string = ''
   private inFlight = 0
   private waitQueue: Array<() => void> = []
-  private lastDispatchAt = 0
+  private nextDispatchAt = 0
   private rateLimitUntil = 0
 
   private async acquireSlot(signal: AbortSignal): Promise<void> {
@@ -115,13 +116,12 @@ export class AntigravityModule implements GatewayModule {
 
   private async waitDispatchWindow(signal: AbortSignal): Promise<void> {
     const now = Date.now()
-    const gapWait = Math.max(0, this.lastDispatchAt + MIN_DISPATCH_GAP_MS - now)
-    const cooldownWait = Math.max(0, this.rateLimitUntil - now)
-    const waitMs = Math.max(gapWait, cooldownWait)
+    const slotAt = Math.max(now, this.nextDispatchAt, this.rateLimitUntil)
+    this.nextDispatchAt = slotAt + MIN_DISPATCH_GAP_MS
+    const waitMs = slotAt - now
     if (waitMs > 0) {
       await sleepAbortable(waitMs, signal)
     }
-    this.lastDispatchAt = Date.now()
   }
 
   async init(context: ModuleContext): Promise<void> {
@@ -244,7 +244,8 @@ export class AntigravityModule implements GatewayModule {
 
         if (status === 429) {
           const hintedMs = parseRetryDelayMs(upstreamRes, lastErrText)
-          const baseBackoff = 1800 * Math.pow(2, attempt) + Math.floor(Math.random() * 500)
+          const scheduledBase = RETRY_BACKOFF_MS[Math.min(attempt, RETRY_BACKOFF_MS.length - 1)]
+          const baseBackoff = scheduledBase + Math.floor(Math.random() * 500)
           const waitMs = Math.min(hintedMs ?? baseBackoff, MAX_RETRY_DELAY_MS)
           this.rateLimitUntil = Math.max(this.rateLimitUntil, Date.now() + waitMs)
 
