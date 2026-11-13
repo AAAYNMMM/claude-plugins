@@ -9,6 +9,7 @@ export interface AntigravityModelConfig extends ModuleModelInfo {
   supportsThinking?: boolean
   supportsImages?: boolean
   tagTitle?: string
+  maxOutputTokens?: number
 }
 
 export const ANTIGRAVITY_API_HOST = 'https://daily-cloudcode-pa.googleapis.com'
@@ -76,6 +77,7 @@ let cachedModels: AntigravityModelConfig[] | null = null
 let cachedAt = 0
 let cachedProjectId: string | null = null
 const dynamicUpstreamMap = new Map<string, string>()
+const dynamicMaxOutputMap = new Map<string, number>()
 
 /**
  * 读取本地 Antigravity IDE 版本（优先 daemon hub 文件，其次安装包 package.json）。
@@ -191,12 +193,16 @@ function inferModelDescription(id: string, name: string, isDefault: boolean, idx
 function parseAvailableModelsResponse(data: RawAvailableModelsResponse): AntigravityModelConfig[] {
   const modelsMap = data.models || {}
   dynamicUpstreamMap.clear()
+  dynamicMaxOutputMap.clear()
 
   // 记录全部启用模型的原始 key 映射，保证指定档位 ID 时也能直接透传
   for (const [id, info] of Object.entries(modelsMap)) {
     if (!info || info.disabled || info.tagTitle === 'Unavailable' || info.isInternal) continue
     dynamicUpstreamMap.set(id, id)
     dynamicUpstreamMap.set(id.toLowerCase(), id)
+    if (typeof info.maxOutputTokens === 'number' && info.maxOutputTokens > 0) {
+      dynamicMaxOutputMap.set(id, info.maxOutputTokens)
+    }
   }
 
   // 按 agentModelSorts 顺序提取展示模型；若缺失则回退 recommended 模型列表
@@ -283,6 +289,7 @@ function parseAvailableModelsResponse(data: RawAvailableModelsResponse): Antigra
       supportsThinking: chosen.info.supportsThinking,
       supportsImages: chosen.info.supportsImages,
       tagTitle: chosen.info.tagTitle,
+      maxOutputTokens: chosen.info.maxOutputTokens,
     })
 
     // 同时注册显示名和基础族 ID 到动态映射表
@@ -409,4 +416,11 @@ export function resolveUpstreamModel(modelId: string): string {
   }
 
   return clean
+}
+
+/**
+ * 获取指定上游模型声明的最大输出 Token 数（用于抑制超大 maxOutputTokens 导致的 TPM 限流预扣）。
+ */
+export function getModelMaxOutputTokens(upstreamModelId: string): number | undefined {
+  return dynamicMaxOutputMap.get(upstreamModelId)
 }

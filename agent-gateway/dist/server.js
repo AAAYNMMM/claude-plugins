@@ -354,6 +354,16 @@ function toOpenAIRequest(input, model) {
 function errorPayload(type, message) {
   return JSON.stringify({ type: "error", error: { type, message } });
 }
+function errorTypeForStatus(status) {
+  if (status === 400 || status === 422) return "invalid_request_error";
+  if (status === 401) return "authentication_error";
+  if (status === 403) return "permission_error";
+  if (status === 404) return "not_found_error";
+  if (status === 413) return "request_too_large";
+  if (status === 429) return "rate_limit_error";
+  if (status === 503 || status === 529) return "overloaded_error";
+  return "api_error";
+}
 async function* sseData(body) {
   const decoder = new TextDecoder();
   let buffer = "";
@@ -7564,14 +7574,14 @@ var WorkBuddyModule = class {
     } catch (err) {
       res.statusCode = 502;
       res.setHeader("Content-Type", "application/json");
-      res.end(JSON.stringify(errorPayload("api_error", `\u65E0\u6CD5\u8FDE\u63A5 WorkBuddy shim: ${err.message}`)));
+      res.end(errorPayload("api_error", `\u65E0\u6CD5\u8FDE\u63A5 WorkBuddy shim: ${err.message}`));
       return;
     }
     if (!upstreamRes.ok) {
       const text2 = await upstreamRes.text();
       res.statusCode = upstreamRes.status;
       res.setHeader("Content-Type", "application/json");
-      res.end(JSON.stringify(errorPayload("api_error", `WorkBuddy \u4E0A\u6E38\u9519\u8BEF (${upstreamRes.status}): ${text2}`)));
+      res.end(errorPayload(errorTypeForStatus(upstreamRes.status), `WorkBuddy \u4E0A\u6E38\u9519\u8BEF (${upstreamRes.status}): ${text2}`));
       return;
     }
     if (request.stream) {
@@ -7676,6 +7686,7 @@ var cachedModels = null;
 var cachedAt = 0;
 var cachedProjectId = null;
 var dynamicUpstreamMap = /* @__PURE__ */ new Map();
+var dynamicMaxOutputMap = /* @__PURE__ */ new Map();
 function getAntigravityVersion() {
   try {
     const daemonDir = join11(homedir7(), ".gemini", "antigravity", "daemon");
@@ -7760,10 +7771,14 @@ function inferModelDescription(id, name, isDefault, idx) {
 function parseAvailableModelsResponse(data) {
   const modelsMap = data.models || {};
   dynamicUpstreamMap.clear();
+  dynamicMaxOutputMap.clear();
   for (const [id, info] of Object.entries(modelsMap)) {
     if (!info || info.disabled || info.tagTitle === "Unavailable" || info.isInternal) continue;
     dynamicUpstreamMap.set(id, id);
     dynamicUpstreamMap.set(id.toLowerCase(), id);
+    if (typeof info.maxOutputTokens === "number" && info.maxOutputTokens > 0) {
+      dynamicMaxOutputMap.set(id, info.maxOutputTokens);
+    }
   }
   const orderedIds = [];
   const seenIds = /* @__PURE__ */ new Set();
@@ -7822,7 +7837,8 @@ function parseAvailableModelsResponse(data) {
       description: inferModelDescription(chosen.id, displayName, isDefault, i),
       supportsThinking: chosen.info.supportsThinking,
       supportsImages: chosen.info.supportsImages,
-      tagTitle: chosen.info.tagTitle
+      tagTitle: chosen.info.tagTitle,
+      maxOutputTokens: chosen.info.maxOutputTokens
     });
     dynamicUpstreamMap.set(chosen.id, chosen.id);
     dynamicUpstreamMap.set(displayName.toLowerCase(), chosen.id);
@@ -7923,6 +7939,9 @@ function resolveUpstreamModel(modelId) {
     }
   }
   return clean;
+}
+function getModelMaxOutputTokens(upstreamModelId) {
+  return dynamicMaxOutputMap.get(upstreamModelId);
 }
 
 // src/modules/antigravity/gemini-converter.ts
@@ -8226,12 +8245,91 @@ var AntigravityAuthManager = class {
 var antigravityAuth = new AntigravityAuthManager();
 
 // src/modules/antigravity/index.ts
+var MAX_CONCURRENT_REQUESTS = 2;
+var MIN_DISPATCH_GAP_MS = 180;
+var MAX_UPSTREAM_RETRIES = 3;
+var MAX_RETRY_DELAY_MS = 2e4;
+var DEFAULT_RETRY_AFTER_SEC = 15;
+function parseRetryDelayMs(res, errText) {
+  const retryAfter = res.headers.get("retry-after");
+  if (retryAfter) {
+    const sec = Number(retryAfter);
+    if (Number.isFinite(sec) && sec > 0) {
+      return Math.min(Math.ceil(sec * 1e3), MAX_RETRY_DELAY_MS);
+    }
+    const dateMs = Date.parse(retryAfter);
+    if (Number.isFinite(dateMs) && dateMs > Date.now()) {
+      return Math.min(dateMs - Date.now(), MAX_RETRY_DELAY_MS);
+    }
+  }
+  const delayMatch = errText.match(/"retryDelay"\s*:\s*"(\d+(?:\.\d+)?)s"/i);
+  if (delayMatch) {
+    return Math.min(Math.ceil(Number(delayMatch[1]) * 1e3), MAX_RETRY_DELAY_MS);
+  }
+  return null;
+}
+function sleepAbortable(ms, signal) {
+  if (ms <= 0 || signal.aborted) {
+    return signal.aborted ? Promise.reject(new DOMException("Aborted", "AbortError")) : Promise.resolve();
+  }
+  return new Promise((resolve5, reject) => {
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(new DOMException("Aborted", "AbortError"));
+    };
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve5();
+    }, ms);
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
 var AntigravityModule = class {
   id = "antigravity";
   name = "\u53CD\u91CD\u529B (Antigravity)";
   description = "\u53CD\u91CD\u529B\u684C\u9762\u7AEF\u514D\u5BC6\u6865\u63A5 (\u52A8\u6001\u6A21\u578B\u540C\u6B65)";
   ctx;
   accountEmail = "";
+  inFlight = 0;
+  waitQueue = [];
+  lastDispatchAt = 0;
+  rateLimitUntil = 0;
+  async acquireSlot(signal) {
+    if (signal.aborted) {
+      throw new DOMException("Aborted", "AbortError");
+    }
+    if (this.inFlight >= MAX_CONCURRENT_REQUESTS) {
+      await new Promise((resolve5, reject) => {
+        const entry = () => {
+          signal.removeEventListener("abort", onAbort);
+          resolve5();
+        };
+        const onAbort = () => {
+          const idx = this.waitQueue.indexOf(entry);
+          if (idx !== -1) this.waitQueue.splice(idx, 1);
+          reject(new DOMException("Aborted", "AbortError"));
+        };
+        signal.addEventListener("abort", onAbort, { once: true });
+        this.waitQueue.push(entry);
+      });
+    }
+    this.inFlight++;
+  }
+  releaseSlot() {
+    this.inFlight = Math.max(0, this.inFlight - 1);
+    const next = this.waitQueue.shift();
+    if (next) next();
+  }
+  async waitDispatchWindow(signal) {
+    const now = Date.now();
+    const gapWait = Math.max(0, this.lastDispatchAt + MIN_DISPATCH_GAP_MS - now);
+    const cooldownWait = Math.max(0, this.rateLimitUntil - now);
+    const waitMs = Math.max(gapWait, cooldownWait);
+    if (waitMs > 0) {
+      await sleepAbortable(waitMs, signal);
+    }
+    this.lastDispatchAt = Date.now();
+  }
   async init(context) {
     this.ctx = context;
     try {
@@ -8257,11 +8355,9 @@ var AntigravityModule = class {
       res.statusCode = 401;
       res.setHeader("Content-Type", "application/json");
       res.end(
-        JSON.stringify(
-          errorPayload(
-            "authentication_error",
-            `\u53CD\u91CD\u529B\u514D\u5BC6\u8BA4\u8BC1\u5931\u8D25: ${err.message}\u3002\u8BF7\u786E\u4FDD\u672C\u673A\u5DF2\u5B89\u88C5\u5E76\u767B\u5F55\u53CD\u91CD\u529B (Antigravity) \u684C\u9762\u7AEF\u3002`
-          )
+        errorPayload(
+          "authentication_error",
+          `\u53CD\u91CD\u529B\u514D\u5BC6\u8BA4\u8BC1\u5931\u8D25: ${err.message}\u3002\u8BF7\u786E\u4FDD\u672C\u673A\u5DF2\u5B89\u88C5\u5E76\u767B\u5F55\u53CD\u91CD\u529B (Antigravity) \u684C\u9762\u7AEF\u3002`
         )
       );
       return;
@@ -8271,6 +8367,10 @@ var AntigravityModule = class {
     const upstreamModel = resolveUpstreamModel(rawModel);
     const { projectId } = await fetchLiveProjectAndTier(accessToken);
     const geminiBody = toGeminiRequest(request);
+    const maxAllowedOut = getModelMaxOutputTokens(upstreamModel);
+    if (maxAllowedOut && geminiBody.generationConfig?.maxOutputTokens && geminiBody.generationConfig.maxOutputTokens > maxAllowedOut) {
+      geminiBody.generationConfig.maxOutputTokens = maxAllowedOut;
+    }
     const payload = {
       project: projectId,
       model: upstreamModel,
@@ -8280,286 +8380,345 @@ var AntigravityModule = class {
     };
     const isStream = !!request.stream;
     const endpoint = isStream ? `${ANTIGRAVITY_API_HOST}/v1internal:streamGenerateContent` : `${ANTIGRAVITY_API_HOST}/v1internal:generateContent`;
-    let upstreamRes;
+    const abortCtrl = new AbortController();
+    const onResClose = () => {
+      if (!res.writableEnded) {
+        abortCtrl.abort();
+      }
+    };
+    res.on("close", onResClose);
+    let slotAcquired = false;
     try {
-      upstreamRes = await fetch(endpoint, {
-        method: "POST",
-        headers: {
-          "Authorization": `Bearer ${accessToken}`,
-          "Content-Type": "application/json",
-          "User-Agent": getAntigravityUserAgent()
-        },
-        body: JSON.stringify(payload)
-      });
-    } catch (err) {
-      res.statusCode = 502;
-      res.setHeader("Content-Type", "application/json");
-      res.end(JSON.stringify(errorPayload("api_error", `\u8FDE\u63A5\u53CD\u91CD\u529B\u7AEF\u70B9\u5931\u8D25: ${err.message}`)));
-      return;
-    }
-    if (!upstreamRes.ok) {
-      const errText = await upstreamRes.text();
-      this.ctx.log(`\u53CD\u91CD\u529B\u8BF7\u6C42\u5931\u8D25 (${upstreamRes.status}) [model: ${upstreamModel}]: ${errText}`);
-      res.statusCode = upstreamRes.status;
-      res.setHeader("Content-Type", "application/json");
-      res.end(JSON.stringify(errorPayload("api_error", `\u53CD\u91CD\u529B\u4E0A\u6E38\u9519\u8BEF (${upstreamRes.status}): ${errText}`)));
-      return;
-    }
-    const messageId = `msg_${randomUUID3().replace(/-/g, "")}`;
-    if (isStream) {
-      res.statusCode = 200;
-      res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
-      res.setHeader("Cache-Control", "no-cache");
-      res.setHeader("Connection", "keep-alive");
-      if (typeof res.flushHeaders === "function") res.flushHeaders();
-      const sendSse = (event, data) => {
-        res.write(`event: ${event}
+      await this.acquireSlot(abortCtrl.signal);
+      slotAcquired = true;
+      let upstreamRes = null;
+      let lastErrText = "";
+      for (let attempt = 0; attempt <= MAX_UPSTREAM_RETRIES; attempt++) {
+        await this.waitDispatchWindow(abortCtrl.signal);
+        try {
+          upstreamRes = await fetch(endpoint, {
+            method: "POST",
+            headers: {
+              "Authorization": `Bearer ${accessToken}`,
+              "Content-Type": "application/json",
+              "User-Agent": getAntigravityUserAgent()
+            },
+            body: JSON.stringify(payload),
+            signal: abortCtrl.signal
+          });
+        } catch (err) {
+          if (abortCtrl.signal.aborted) return;
+          if (attempt < MAX_UPSTREAM_RETRIES) {
+            const delayMs = 1e3 * (attempt + 1) + Math.floor(Math.random() * 400);
+            this.ctx.log(`\u8FDE\u63A5\u53CD\u91CD\u529B\u7AEF\u70B9\u5F02\u5E38\uFF0C${delayMs}ms \u540E\u7B2C ${attempt + 1} \u6B21\u91CD\u8BD5 [model: ${upstreamModel}]: ${err.message}`);
+            await sleepAbortable(delayMs, abortCtrl.signal);
+            continue;
+          }
+          res.statusCode = 502;
+          res.setHeader("Content-Type", "application/json");
+          res.end(errorPayload("api_error", `\u8FDE\u63A5\u53CD\u91CD\u529B\u7AEF\u70B9\u5931\u8D25: ${err.message}`));
+          return;
+        }
+        if (upstreamRes.ok) break;
+        lastErrText = await upstreamRes.text();
+        const status = upstreamRes.status;
+        const isRetryable = status === 429 || status === 502 || status === 503 || status === 529;
+        if (status === 429) {
+          const hintedMs = parseRetryDelayMs(upstreamRes, lastErrText);
+          const baseBackoff = 1800 * Math.pow(2, attempt) + Math.floor(Math.random() * 500);
+          const waitMs = Math.min(hintedMs ?? baseBackoff, MAX_RETRY_DELAY_MS);
+          this.rateLimitUntil = Math.max(this.rateLimitUntil, Date.now() + waitMs);
+          if (attempt < MAX_UPSTREAM_RETRIES) {
+            this.ctx.log(
+              `\u53CD\u91CD\u529B\u89E6\u53D1\u9650\u6D41 (429) [model: ${upstreamModel}]\uFF0C\u51B7\u5374 ${waitMs}ms \u540E\u81EA\u52A8\u7B2C ${attempt + 1}/${MAX_UPSTREAM_RETRIES} \u6B21\u91CD\u8BD5`
+            );
+            await sleepAbortable(waitMs, abortCtrl.signal);
+            continue;
+          }
+        } else if (isRetryable && attempt < MAX_UPSTREAM_RETRIES) {
+          const waitMs = Math.min(1200 * Math.pow(2, attempt) + Math.floor(Math.random() * 400), MAX_RETRY_DELAY_MS);
+          this.ctx.log(
+            `\u53CD\u91CD\u529B\u4E0A\u6E38\u4E34\u65F6\u9519\u8BEF (${status}) [model: ${upstreamModel}]\uFF0C${waitMs}ms \u540E\u81EA\u52A8\u91CD\u8BD5 (${attempt + 1}/${MAX_UPSTREAM_RETRIES})`
+          );
+          await sleepAbortable(waitMs, abortCtrl.signal);
+          continue;
+        }
+        this.ctx.log(`\u53CD\u91CD\u529B\u8BF7\u6C42\u5931\u8D25 (${status}) [model: ${upstreamModel}]: ${lastErrText}`);
+        res.statusCode = status;
+        res.setHeader("Content-Type", "application/json");
+        if (status === 429) {
+          const hintedMs = parseRetryDelayMs(upstreamRes, lastErrText);
+          const retryAfterSec = hintedMs ? Math.max(1, Math.ceil(hintedMs / 1e3)) : DEFAULT_RETRY_AFTER_SEC;
+          res.setHeader("Retry-After", String(retryAfterSec));
+        }
+        res.end(
+          errorPayload(errorTypeForStatus(status), `\u53CD\u91CD\u529B\u4E0A\u6E38\u9519\u8BEF (${status}): ${lastErrText}`)
+        );
+        return;
+      }
+      if (!upstreamRes) return;
+      const messageId = `msg_${randomUUID3().replace(/-/g, "")}`;
+      if (isStream) {
+        res.statusCode = 200;
+        res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+        res.setHeader("Cache-Control", "no-cache");
+        res.setHeader("Connection", "keep-alive");
+        if (typeof res.flushHeaders === "function") res.flushHeaders();
+        const sendSse = (event, data) => {
+          res.write(`event: ${event}
 data: ${JSON.stringify(data)}
 
 `);
-      };
-      sendSse("message_start", {
-        type: "message_start",
-        message: {
-          id: messageId,
-          type: "message",
-          role: "assistant",
-          content: [],
-          model: request.model,
-          stop_reason: null,
-          stop_sequence: null,
-          usage: { input_tokens: 0, output_tokens: 0 }
-        }
-      });
-      let currentBlockIndex = -1;
-      let activeBlock = "none";
-      let stopReason = "end_turn";
-      let totalInputTokens = 0;
-      let totalOutputTokens = 0;
-      const closeActiveBlock = () => {
-        if (activeBlock !== "none") {
-          sendSse("content_block_stop", {
-            type: "content_block_stop",
-            index: currentBlockIndex
-          });
-          activeBlock = "none";
-        }
-      };
-      const reader = upstreamRes.body?.getReader();
-      const decoder = new TextDecoder("utf8");
-      let streamBuffer = "";
-      if (reader) {
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          streamBuffer += decoder.decode(value, { stream: true });
+        };
+        sendSse("message_start", {
+          type: "message_start",
+          message: {
+            id: messageId,
+            type: "message",
+            role: "assistant",
+            content: [],
+            model: request.model,
+            stop_reason: null,
+            stop_sequence: null,
+            usage: { input_tokens: 0, output_tokens: 0 }
+          }
+        });
+        let currentBlockIndex = -1;
+        let activeBlock = "none";
+        let stopReason = "end_turn";
+        let totalInputTokens = 0;
+        let totalOutputTokens = 0;
+        const closeActiveBlock = () => {
+          if (activeBlock !== "none") {
+            sendSse("content_block_stop", {
+              type: "content_block_stop",
+              index: currentBlockIndex
+            });
+            activeBlock = "none";
+          }
+        };
+        const reader = upstreamRes.body?.getReader();
+        const decoder = new TextDecoder("utf8");
+        let streamBuffer = "";
+        if (reader) {
           while (true) {
-            const startIdx = streamBuffer.indexOf('{\n  "response"') !== -1 ? streamBuffer.indexOf('{\n  "response"') : streamBuffer.indexOf('{"response"');
-            if (startIdx === -1) {
-              const altIdx = streamBuffer.indexOf("{");
-              if (altIdx === -1) {
-                streamBuffer = "";
-                break;
+            const { done, value } = await reader.read();
+            if (done) break;
+            streamBuffer += decoder.decode(value, { stream: true });
+            while (true) {
+              const startIdx = streamBuffer.indexOf('{\n  "response"') !== -1 ? streamBuffer.indexOf('{\n  "response"') : streamBuffer.indexOf('{"response"');
+              if (startIdx === -1) {
+                const altIdx = streamBuffer.indexOf("{");
+                if (altIdx === -1) {
+                  streamBuffer = "";
+                  break;
+                }
+                if (altIdx > 0) {
+                  streamBuffer = streamBuffer.slice(altIdx);
+                }
+              } else if (startIdx > 0) {
+                streamBuffer = streamBuffer.slice(startIdx);
               }
-              if (altIdx > 0) {
-                streamBuffer = streamBuffer.slice(altIdx);
-              }
-            } else if (startIdx > 0) {
-              streamBuffer = streamBuffer.slice(startIdx);
-            }
-            let depth = 0;
-            let endIdx = -1;
-            let inString = false;
-            let escape = false;
-            for (let i = 0; i < streamBuffer.length; i++) {
-              const ch = streamBuffer[i];
-              if (escape) {
-                escape = false;
-                continue;
-              }
-              if (ch === "\\") {
-                escape = true;
-                continue;
-              }
-              if (ch === '"') {
-                inString = !inString;
-                continue;
-              }
-              if (!inString) {
-                if (ch === "{") depth++;
-                else if (ch === "}") {
-                  depth--;
-                  if (depth === 0) {
-                    endIdx = i;
-                    break;
+              let depth = 0;
+              let endIdx = -1;
+              let inString = false;
+              let escape = false;
+              for (let i = 0; i < streamBuffer.length; i++) {
+                const ch = streamBuffer[i];
+                if (escape) {
+                  escape = false;
+                  continue;
+                }
+                if (ch === "\\") {
+                  escape = true;
+                  continue;
+                }
+                if (ch === '"') {
+                  inString = !inString;
+                  continue;
+                }
+                if (!inString) {
+                  if (ch === "{") depth++;
+                  else if (ch === "}") {
+                    depth--;
+                    if (depth === 0) {
+                      endIdx = i;
+                      break;
+                    }
                   }
                 }
               }
-            }
-            if (endIdx === -1) break;
-            const jsonStr = streamBuffer.slice(0, endIdx + 1);
-            streamBuffer = streamBuffer.slice(endIdx + 1);
-            try {
-              const parsed = JSON.parse(jsonStr);
-              const resp = parsed.response ?? parsed;
-              const candidate = resp.candidates?.[0];
-              const parts = candidate?.content?.parts;
-              if (resp.usageMetadata) {
-                if (typeof resp.usageMetadata.promptTokenCount === "number") {
-                  totalInputTokens = resp.usageMetadata.promptTokenCount;
+              if (endIdx === -1) break;
+              const jsonStr = streamBuffer.slice(0, endIdx + 1);
+              streamBuffer = streamBuffer.slice(endIdx + 1);
+              try {
+                const parsed = JSON.parse(jsonStr);
+                const resp = parsed.response ?? parsed;
+                const candidate = resp.candidates?.[0];
+                const parts = candidate?.content?.parts;
+                if (resp.usageMetadata) {
+                  if (typeof resp.usageMetadata.promptTokenCount === "number") {
+                    totalInputTokens = resp.usageMetadata.promptTokenCount;
+                  }
+                  const candTok = resp.usageMetadata.candidatesTokenCount ?? 0;
+                  const thoughtTok = resp.usageMetadata.thoughtsTokenCount ?? 0;
+                  if (candTok + thoughtTok > 0) {
+                    totalOutputTokens = candTok + thoughtTok;
+                  }
                 }
-                const candTok = resp.usageMetadata.candidatesTokenCount ?? 0;
-                const thoughtTok = resp.usageMetadata.thoughtsTokenCount ?? 0;
-                if (candTok + thoughtTok > 0) {
-                  totalOutputTokens = candTok + thoughtTok;
+                if (candidate?.finishReason === "MAX_TOKENS" && stopReason !== "tool_use") {
+                  stopReason = "max_tokens";
                 }
-              }
-              if (candidate?.finishReason === "MAX_TOKENS" && stopReason !== "tool_use") {
-                stopReason = "max_tokens";
-              }
-              if (Array.isArray(parts)) {
-                for (const part of parts) {
-                  if (typeof part.text === "string" && part.text) {
-                    if (part.thought === true) {
-                      if (activeBlock !== "thinking") {
-                        closeActiveBlock();
-                        currentBlockIndex++;
-                        sendSse("content_block_start", {
-                          type: "content_block_start",
-                          index: currentBlockIndex,
-                          content_block: { type: "thinking", thinking: "" }
-                        });
-                        activeBlock = "thinking";
-                      }
-                      totalOutputTokens += Math.ceil(part.text.length / 3);
-                      sendSse("content_block_delta", {
-                        type: "content_block_delta",
-                        index: currentBlockIndex,
-                        delta: { type: "thinking_delta", thinking: part.text }
-                      });
-                      if (typeof part.thoughtSignature === "string" && part.thoughtSignature) {
+                if (Array.isArray(parts)) {
+                  for (const part of parts) {
+                    if (typeof part.text === "string" && part.text) {
+                      if (part.thought === true) {
+                        if (activeBlock !== "thinking") {
+                          closeActiveBlock();
+                          currentBlockIndex++;
+                          sendSse("content_block_start", {
+                            type: "content_block_start",
+                            index: currentBlockIndex,
+                            content_block: { type: "thinking", thinking: "" }
+                          });
+                          activeBlock = "thinking";
+                        }
+                        totalOutputTokens += Math.ceil(part.text.length / 3);
                         sendSse("content_block_delta", {
                           type: "content_block_delta",
                           index: currentBlockIndex,
-                          delta: { type: "signature_delta", signature: part.thoughtSignature }
+                          delta: { type: "thinking_delta", thinking: part.text }
                         });
-                      }
-                    } else {
-                      if (activeBlock !== "text") {
-                        closeActiveBlock();
-                        currentBlockIndex++;
-                        sendSse("content_block_start", {
-                          type: "content_block_start",
+                        if (typeof part.thoughtSignature === "string" && part.thoughtSignature) {
+                          sendSse("content_block_delta", {
+                            type: "content_block_delta",
+                            index: currentBlockIndex,
+                            delta: { type: "signature_delta", signature: part.thoughtSignature }
+                          });
+                        }
+                      } else {
+                        if (activeBlock !== "text") {
+                          closeActiveBlock();
+                          currentBlockIndex++;
+                          sendSse("content_block_start", {
+                            type: "content_block_start",
+                            index: currentBlockIndex,
+                            content_block: { type: "text", text: "" }
+                          });
+                          activeBlock = "text";
+                        }
+                        totalOutputTokens += Math.ceil(part.text.length / 3);
+                        sendSse("content_block_delta", {
+                          type: "content_block_delta",
                           index: currentBlockIndex,
-                          content_block: { type: "text", text: "" }
+                          delta: { type: "text_delta", text: part.text }
                         });
-                        activeBlock = "text";
                       }
-                      totalOutputTokens += Math.ceil(part.text.length / 3);
+                    }
+                    if (part.functionCall && typeof part.functionCall === "object") {
+                      closeActiveBlock();
+                      stopReason = "tool_use";
+                      currentBlockIndex++;
+                      const toolUseId = `toolu_${randomUUID3().replace(/-/g, "").slice(0, 24)}`;
+                      const argsJson = JSON.stringify(part.functionCall.args ?? {});
+                      totalOutputTokens += Math.ceil(argsJson.length / 3) + 10;
+                      sendSse("content_block_start", {
+                        type: "content_block_start",
+                        index: currentBlockIndex,
+                        content_block: {
+                          type: "tool_use",
+                          id: toolUseId,
+                          name: part.functionCall.name,
+                          input: {}
+                        }
+                      });
                       sendSse("content_block_delta", {
                         type: "content_block_delta",
                         index: currentBlockIndex,
-                        delta: { type: "text_delta", text: part.text }
+                        delta: {
+                          type: "input_json_delta",
+                          partial_json: argsJson
+                        }
+                      });
+                      sendSse("content_block_stop", {
+                        type: "content_block_stop",
+                        index: currentBlockIndex
                       });
                     }
                   }
-                  if (part.functionCall && typeof part.functionCall === "object") {
-                    closeActiveBlock();
-                    stopReason = "tool_use";
-                    currentBlockIndex++;
-                    const toolUseId = `toolu_${randomUUID3().replace(/-/g, "").slice(0, 24)}`;
-                    const argsJson = JSON.stringify(part.functionCall.args ?? {});
-                    totalOutputTokens += Math.ceil(argsJson.length / 3) + 10;
-                    sendSse("content_block_start", {
-                      type: "content_block_start",
-                      index: currentBlockIndex,
-                      content_block: {
-                        type: "tool_use",
-                        id: toolUseId,
-                        name: part.functionCall.name,
-                        input: {}
-                      }
-                    });
-                    sendSse("content_block_delta", {
-                      type: "content_block_delta",
-                      index: currentBlockIndex,
-                      delta: {
-                        type: "input_json_delta",
-                        partial_json: argsJson
-                      }
-                    });
-                    sendSse("content_block_stop", {
-                      type: "content_block_stop",
-                      index: currentBlockIndex
-                    });
-                  }
                 }
+              } catch {
               }
-            } catch {
             }
           }
         }
-      }
-      closeActiveBlock();
-      sendSse("message_delta", {
-        type: "message_delta",
-        delta: { stop_reason: stopReason, stop_sequence: null },
-        usage: {
-          ...totalInputTokens > 0 ? { input_tokens: totalInputTokens } : {},
-          output_tokens: totalOutputTokens
-        }
-      });
-      sendSse("message_stop", { type: "message_stop" });
-      res.end();
-    } else {
-      const data = await upstreamRes.json();
-      const resp = data.response ?? data;
-      const candidate = resp.candidates?.[0];
-      const parts = candidate?.content?.parts ?? [];
-      const content = [];
-      let stopReason = candidate?.finishReason === "MAX_TOKENS" ? "max_tokens" : "end_turn";
-      for (const part of parts) {
-        if (typeof part.text === "string" && part.text) {
-          if (part.thought === true) {
-            content.push({
-              type: "thinking",
-              thinking: part.text,
-              ...part.thoughtSignature ? { signature: part.thoughtSignature } : {}
-            });
-          } else {
-            content.push({ type: "text", text: part.text });
-          }
-        }
-        if (part.functionCall && typeof part.functionCall === "object") {
-          stopReason = "tool_use";
-          content.push({
-            type: "tool_use",
-            id: `toolu_${randomUUID3().replace(/-/g, "").slice(0, 24)}`,
-            name: part.functionCall.name,
-            input: part.functionCall.args ?? {}
-          });
-        }
-      }
-      const usageMeta = resp.usageMetadata ?? {};
-      const inputTokens = typeof usageMeta.promptTokenCount === "number" ? usageMeta.promptTokenCount : 0;
-      const outputTokens = (usageMeta.candidatesTokenCount ?? 0) + (usageMeta.thoughtsTokenCount ?? 0) || 50;
-      res.statusCode = 200;
-      res.setHeader("Content-Type", "application/json");
-      res.end(
-        JSON.stringify({
-          id: messageId,
-          type: "message",
-          role: "assistant",
-          content,
-          model: request.model,
-          stop_reason: stopReason,
-          stop_sequence: null,
+        closeActiveBlock();
+        sendSse("message_delta", {
+          type: "message_delta",
+          delta: { stop_reason: stopReason, stop_sequence: null },
           usage: {
-            input_tokens: inputTokens,
-            output_tokens: outputTokens
+            ...totalInputTokens > 0 ? { input_tokens: totalInputTokens } : {},
+            output_tokens: totalOutputTokens
           }
-        })
-      );
+        });
+        sendSse("message_stop", { type: "message_stop" });
+        res.end();
+      } else {
+        const data = await upstreamRes.json();
+        const resp = data.response ?? data;
+        const candidate = resp.candidates?.[0];
+        const parts = candidate?.content?.parts ?? [];
+        const content = [];
+        let stopReason = candidate?.finishReason === "MAX_TOKENS" ? "max_tokens" : "end_turn";
+        for (const part of parts) {
+          if (typeof part.text === "string" && part.text) {
+            if (part.thought === true) {
+              content.push({
+                type: "thinking",
+                thinking: part.text,
+                ...part.thoughtSignature ? { signature: part.thoughtSignature } : {}
+              });
+            } else {
+              content.push({ type: "text", text: part.text });
+            }
+          }
+          if (part.functionCall && typeof part.functionCall === "object") {
+            stopReason = "tool_use";
+            content.push({
+              type: "tool_use",
+              id: `toolu_${randomUUID3().replace(/-/g, "").slice(0, 24)}`,
+              name: part.functionCall.name,
+              input: part.functionCall.args ?? {}
+            });
+          }
+        }
+        const usageMeta = resp.usageMetadata ?? {};
+        const inputTokens = typeof usageMeta.promptTokenCount === "number" ? usageMeta.promptTokenCount : 0;
+        const outputTokens = (usageMeta.candidatesTokenCount ?? 0) + (usageMeta.thoughtsTokenCount ?? 0) || 50;
+        res.statusCode = 200;
+        res.setHeader("Content-Type", "application/json");
+        res.end(
+          JSON.stringify({
+            id: messageId,
+            type: "message",
+            role: "assistant",
+            content,
+            model: request.model,
+            stop_reason: stopReason,
+            stop_sequence: null,
+            usage: {
+              input_tokens: inputTokens,
+              output_tokens: outputTokens
+            }
+          })
+        );
+      }
+    } catch (err) {
+      if (abortCtrl.signal.aborted) return;
+      throw err;
+    } finally {
+      res.off("close", onResClose);
+      if (slotAcquired) this.releaseSlot();
     }
   }
   async fetchLiveUserStatus() {
@@ -8676,7 +8835,7 @@ var PassthroughModule = class {
     } catch (err) {
       res.statusCode = 502;
       res.setHeader("Content-Type", "application/json");
-      res.end(JSON.stringify(errorPayload("api_error", `\u65E0\u6CD5\u8FDE\u63A5\u900F\u4F20\u4E0A\u6E38: ${err.message}`)));
+      res.end(errorPayload("api_error", `\u65E0\u6CD5\u8FDE\u63A5\u900F\u4F20\u4E0A\u6E38: ${err.message}`));
       return;
     }
     res.statusCode = upstreamRes.status;
@@ -8883,14 +9042,14 @@ function createGatewayServer(options) {
       if (!valid) {
         res.statusCode = 401;
         res.setHeader("Content-Type", "application/json");
-        res.end(JSON.stringify(errorPayload("authentication_error", "\u7F51\u5173\u672C\u5730\u4EE4\u724C\u65E0\u6548")));
+        res.end(errorPayload("authentication_error", "\u7F51\u5173\u672C\u5730\u4EE4\u724C\u65E0\u6548"));
         return;
       }
     } else {
       if (!clientKey) {
         res.statusCode = 401;
         res.setHeader("Content-Type", "application/json");
-        res.end(JSON.stringify(errorPayload("authentication_error", "\u7F3A\u5C11 Authorization \u51ED\u636E")));
+        res.end(errorPayload("authentication_error", "\u7F3A\u5C11 Authorization \u51ED\u636E"));
         return;
       }
     }
@@ -8926,7 +9085,7 @@ function createGatewayServer(options) {
       } catch {
         res.statusCode = 400;
         res.setHeader("Content-Type", "application/json");
-        res.end(JSON.stringify(errorPayload("invalid_request_error", "\u65E0\u6548\u7684 count_tokens \u8BF7\u6C42\u4F53")));
+        res.end(errorPayload("invalid_request_error", "\u65E0\u6548\u7684 count_tokens \u8BF7\u6C42\u4F53"));
       }
       return;
     }
@@ -8937,7 +9096,7 @@ function createGatewayServer(options) {
       } catch (err) {
         res.statusCode = 413;
         res.setHeader("Content-Type", "application/json");
-        res.end(JSON.stringify(errorPayload("invalid_request_error", err.message)));
+        res.end(errorPayload("invalid_request_error", err.message));
         return;
       }
       let parsed;
@@ -8946,7 +9105,7 @@ function createGatewayServer(options) {
       } catch {
         res.statusCode = 400;
         res.setHeader("Content-Type", "application/json");
-        res.end(JSON.stringify(errorPayload("invalid_request_error", "\u8BF7\u6C42\u4F53\u4E0D\u662F\u5408\u6CD5\u7684 JSON")));
+        res.end(errorPayload("invalid_request_error", "\u8BF7\u6C42\u4F53\u4E0D\u662F\u5408\u6CD5\u7684 JSON"));
         return;
       }
       const reqModel = parsed.model ?? "";
@@ -8969,7 +9128,7 @@ function createGatewayServer(options) {
             if (!res.headersSent) {
               res.statusCode = 500;
               res.setHeader("Content-Type", "application/json");
-              res.end(JSON.stringify(errorPayload("api_error", err.message)));
+              res.end(errorPayload("api_error", err.message));
             }
             return;
           }
@@ -9004,7 +9163,7 @@ function createGatewayServer(options) {
     }
     res.statusCode = 404;
     res.setHeader("Content-Type", "application/json");
-    res.end(JSON.stringify(errorPayload("not_found_error", `\u4E0D\u652F\u6301\u7684\u8DEF\u5F84: ${path}`)));
+    res.end(errorPayload("not_found_error", `\u4E0D\u652F\u6301\u7684\u8DEF\u5F84: ${path}`));
   });
   return {
     server,
@@ -9159,13 +9318,15 @@ async function syncGatewayRoutes(host, config, options = {}) {
   return activeSyncPromise;
 }
 async function doSyncGatewayRoutes(host, config, options = {}) {
-  const log = options.silent ? () => {
-  } : logMessage;
-  await host.initAll({
-    gatewayPort: config.port,
-    log,
-    dataDir: DATA_DIR
-  });
+  if (!options.skipInit) {
+    const log = options.silent ? () => {
+    } : logMessage;
+    await host.initAll({
+      gatewayPort: config.port,
+      log,
+      dataDir: DATA_DIR
+    });
+  }
   const aggregated = await host.aggregateModels();
   if (!aggregated || aggregated.length === 0) {
     return config.routes;
@@ -9316,7 +9477,25 @@ async function main() {
       process.stdout.write("\u6B63\u5728\u540C\u6B65\u5404\u6A21\u5757\u6700\u65B0\u53EF\u7528\u6A21\u578B\u5E76\u6784\u5EFA\u5408\u89C4\u8DEF\u7531...\n");
     }
     let currentConfig = loadGatewayConfig();
-    const freshRoutes = await syncGatewayRoutes(host, currentConfig, { silent: isSilent });
+    let freshRoutes = null;
+    if (isRunning) {
+      try {
+        const syncRes = await fetch(`http://127.0.0.1:${currentConfig.port}/v1/gateway/sync`, {
+          method: "POST",
+          signal: AbortSignal.timeout(12e3)
+        });
+        if (syncRes.ok) {
+          const syncJson = await syncRes.json();
+          if (syncJson.ok && syncJson.routes && Object.keys(syncJson.routes).length > 0) {
+            freshRoutes = syncJson.routes;
+          }
+        }
+      } catch {
+      }
+    }
+    if (!freshRoutes) {
+      freshRoutes = await syncGatewayRoutes(host, currentConfig, { silent: isSilent });
+    }
     const routeAliases = Object.keys(freshRoutes);
     const primaryAlias = routeAliases[1] ?? routeAliases[0] ?? "claude-sonnet-5-5";
     const smallAlias = routeAliases.find((a) => freshRoutes[a]?.targetModel?.includes("flash")) ?? routeAliases[0] ?? "claude-haiku-5-5";
@@ -9454,14 +9633,15 @@ async function main() {
     log: logMessage,
     dataDir: DATA_DIR
   });
-  await syncGatewayRoutes(host, config, { silent: true });
   const gatewayServer = createGatewayServer({
     config,
     host,
     log: logMessage,
-    onSyncRequest: () => syncGatewayRoutes(host, config, { silent: true })
+    onSyncRequest: () => syncGatewayRoutes(host, config, { silent: true, skipInit: true })
   });
   await gatewayServer.start();
+  syncGatewayRoutes(host, config, { silent: true, skipInit: true }).catch(() => {
+  });
   writeFileSync2(
     STATUS_FILE,
     JSON.stringify(

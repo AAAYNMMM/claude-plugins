@@ -17,6 +17,7 @@ import type {
 import {
   collectAnthropic,
   errorPayload,
+  errorTypeForStatus,
   streamAnthropic,
   toOpenAIRequest,
 } from '../../core/protocol/anthropic.ts'
@@ -301,7 +302,7 @@ export class WorkBuddyModule implements GatewayModule {
     } catch (err: any) {
       res.statusCode = 502
       res.setHeader('Content-Type', 'application/json')
-      res.end(JSON.stringify(errorPayload('api_error', `无法连接 WorkBuddy shim: ${err.message}`)))
+      res.end(errorPayload('api_error', `无法连接 WorkBuddy shim: ${err.message}`))
       return
     }
 
@@ -309,7 +310,7 @@ export class WorkBuddyModule implements GatewayModule {
       const text = await upstreamRes.text()
       res.statusCode = upstreamRes.status
       res.setHeader('Content-Type', 'application/json')
-      res.end(JSON.stringify(errorPayload('api_error', `WorkBuddy 上游错误 (${upstreamRes.status}): ${text}`)))
+      res.end(errorPayload(errorTypeForStatus(upstreamRes.status), `WorkBuddy 上游错误 (${upstreamRes.status}): ${text}`))
       return
     }
 

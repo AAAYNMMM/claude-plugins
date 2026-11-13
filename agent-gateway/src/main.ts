@@ -167,7 +167,7 @@ let activeSyncPromise: Promise<Record<string, RouteConfig>> | null = null
 async function syncGatewayRoutes(
   host: ModuleHost,
   config: GatewayConfig,
-  options: { silent?: boolean; updateClaude?: boolean } = {}
+  options: { silent?: boolean; updateClaude?: boolean; skipInit?: boolean } = {}
 ): Promise<Record<string, RouteConfig>> {
   if (activeSyncPromise) {
     return activeSyncPromise
@@ -185,14 +185,16 @@ async function syncGatewayRoutes(
 async function doSyncGatewayRoutes(
   host: ModuleHost,
   config: GatewayConfig,
-  options: { silent?: boolean; updateClaude?: boolean } = {}
+  options: { silent?: boolean; updateClaude?: boolean; skipInit?: boolean } = {}
 ): Promise<Record<string, RouteConfig>> {
-  const log = options.silent ? () => {} : logMessage
-  await host.initAll({
-    gatewayPort: config.port,
-    log,
-    dataDir: DATA_DIR,
-  })
+  if (!options.skipInit) {
+    const log = options.silent ? () => {} : logMessage
+    await host.initAll({
+      gatewayPort: config.port,
+      log,
+      dataDir: DATA_DIR,
+    })
+  }
 
   const aggregated = await host.aggregateModels()
   if (!aggregated || aggregated.length === 0) {
@@ -373,7 +375,24 @@ async function main() {
       process.stdout.write('正在同步各模块最新可用模型并构建合规路由...\n')
     }
     let currentConfig = loadGatewayConfig()
-    const freshRoutes = await syncGatewayRoutes(host, currentConfig, { silent: isSilent })
+    let freshRoutes: Record<string, RouteConfig> | null = null
+    if (isRunning) {
+      try {
+        const syncRes = await fetch(`http://127.0.0.1:${currentConfig.port}/v1/gateway/sync`, {
+          method: 'POST',
+          signal: AbortSignal.timeout(12000),
+        })
+        if (syncRes.ok) {
+          const syncJson = (await syncRes.json()) as { ok?: boolean; routes?: Record<string, RouteConfig> }
+          if (syncJson.ok && syncJson.routes && Object.keys(syncJson.routes).length > 0) {
+            freshRoutes = syncJson.routes
+          }
+        }
+      } catch {}
+    }
+    if (!freshRoutes) {
+      freshRoutes = await syncGatewayRoutes(host, currentConfig, { silent: isSilent })
+    }
 
     // 同步切换 CLI 与 Code 标签页环境至本地网关
     const routeAliases = Object.keys(freshRoutes)
@@ -510,17 +529,17 @@ async function main() {
     dataDir: DATA_DIR,
   })
 
-  // 启动时自动执行一次全量模型同步与配置更新（网关启动就自动更新一次模型）
-  await syncGatewayRoutes(host, config, { silent: true })
-
   const gatewayServer = createGatewayServer({
     config,
     host,
     log: logMessage,
-    onSyncRequest: () => syncGatewayRoutes(host, config, { silent: true }),
+    onSyncRequest: () => syncGatewayRoutes(host, config, { silent: true, skipInit: true }),
   })
 
   await gatewayServer.start()
+
+  // 端口就绪后立即执行一次全量模型同步与配置更新（启动即自动更新，同时避免阻塞端口绑定触发客户端 ECONNREFUSED）
+  syncGatewayRoutes(host, config, { silent: true, skipInit: true }).catch(() => {})
 
   writeFileSync(
     STATUS_FILE,

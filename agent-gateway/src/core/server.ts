@@ -137,7 +137,7 @@ export function createGatewayServer(options: ServerOptions): {
       if (!valid) {
         res.statusCode = 401
         res.setHeader('Content-Type', 'application/json')
-        res.end(JSON.stringify(errorPayload('authentication_error', '网关本地令牌无效')))
+        res.end(errorPayload('authentication_error', '网关本地令牌无效'))
         return
       }
     } else {
@@ -145,7 +145,7 @@ export function createGatewayServer(options: ServerOptions): {
       if (!clientKey) {
         res.statusCode = 401
         res.setHeader('Content-Type', 'application/json')
-        res.end(JSON.stringify(errorPayload('authentication_error', '缺少 Authorization 凭据')))
+        res.end(errorPayload('authentication_error', '缺少 Authorization 凭据'))
         return
       }
     }
@@ -183,7 +183,7 @@ export function createGatewayServer(options: ServerOptions): {
       } catch {
         res.statusCode = 400
         res.setHeader('Content-Type', 'application/json')
-        res.end(JSON.stringify(errorPayload('invalid_request_error', '无效的 count_tokens 请求体')))
+        res.end(errorPayload('invalid_request_error', '无效的 count_tokens 请求体'))
       }
       return
     }
@@ -196,7 +196,7 @@ export function createGatewayServer(options: ServerOptions): {
       } catch (err: any) {
         res.statusCode = 413
         res.setHeader('Content-Type', 'application/json')
-        res.end(JSON.stringify(errorPayload('invalid_request_error', err.message)))
+        res.end(errorPayload('invalid_request_error', err.message))
         return
       }
 
@@ -206,7 +206,7 @@ export function createGatewayServer(options: ServerOptions): {
       } catch {
         res.statusCode = 400
         res.setHeader('Content-Type', 'application/json')
-        res.end(JSON.stringify(errorPayload('invalid_request_error', '请求体不是合法的 JSON')))
+        res.end(errorPayload('invalid_request_error', '请求体不是合法的 JSON'))
         return
       }
 
@@ -232,7 +232,7 @@ export function createGatewayServer(options: ServerOptions): {
             if (!res.headersSent) {
               res.statusCode = 500
               res.setHeader('Content-Type', 'application/json')
-              res.end(JSON.stringify(errorPayload('api_error', err.message)))
+              res.end(errorPayload('api_error', err.message))
             }
             return
           }
@@ -279,7 +279,7 @@ export function createGatewayServer(options: ServerOptions): {
 
     res.statusCode = 404
     res.setHeader('Content-Type', 'application/json')
-    res.end(JSON.stringify(errorPayload('not_found_error', `不支持的路径: ${path}`)))
+    res.end(errorPayload('not_found_error', `不支持的路径: ${path}`))
   })
 
   return {

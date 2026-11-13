@@ -69,7 +69,7 @@ export class PassthroughModule implements GatewayModule {
     } catch (err: any) {
       res.statusCode = 502
       res.setHeader('Content-Type', 'application/json')
-      res.end(JSON.stringify(errorPayload('api_error', `无法连接透传上游: ${err.message}`)))
+      res.end(errorPayload('api_error', `无法连接透传上游: ${err.message}`))
       return
     }
 
