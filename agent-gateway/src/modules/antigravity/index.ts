@@ -7,6 +7,9 @@
 
 import type { ServerResponse } from 'node:http'
 import { randomUUID } from 'node:crypto'
+import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs'
+import { join } from 'node:path'
+import { homedir } from 'node:os'
 import type {
   GatewayModule,
   ModuleContext,
@@ -26,7 +29,7 @@ const PROJECT_ID = 'aicode-consumers'
 export class AntigravityModule implements GatewayModule {
   readonly id = 'antigravity'
   readonly name = '反重力 (Antigravity)'
-  readonly description = '反重力桌面端免密桥接 (Gemini 3.8 / Claude 5.5 / GPT-OSS 120B)'
+  readonly description = '反重力桌面端免密桥接 (Gemini 3.8 / Claude 4.6 / GPT-OSS 120B)'
 
   private ctx!: ModuleContext
   private accountEmail: string = ''
@@ -409,13 +412,70 @@ export class AntigravityModule implements GatewayModule {
     }
   }
 
+  private async fetchLiveUserStatus(): Promise<any | null> {
+    const daemonDir = join(homedir(), '.gemini', 'antigravity', 'daemon')
+    if (!existsSync(daemonDir)) return null
+
+    try {
+      const hubFiles = readdirSync(daemonDir)
+        .filter((f) => f.startsWith('hub_') && f.endsWith('.json'))
+        .map((f) => {
+          const full = join(daemonDir, f)
+          return { full, mtime: statSync(full).mtimeMs }
+        })
+        .sort((a, b) => b.mtime - a.mtime)
+
+      if (hubFiles.length === 0) return null
+
+      for (const hub of hubFiles) {
+        try {
+          const info = JSON.parse(readFileSync(hub.full, 'utf8'))
+          if (!info.httpPort || !info.csrfToken) continue
+
+          const controller = new AbortController()
+          const timer = setTimeout(() => controller.abort(), 1200)
+          const res = await fetch(
+            `http://127.0.0.1:${info.httpPort}/exa.language_server_pb.LanguageServerService/GetUserStatus`,
+            {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'x-codeium-csrf-token': info.csrfToken,
+              },
+              body: JSON.stringify({}),
+              signal: controller.signal,
+            }
+          )
+          clearTimeout(timer)
+          if (res.ok) {
+            const data = await res.json()
+            return data?.userStatus ?? null
+          }
+        } catch {}
+      }
+    } catch {}
+    return null
+  }
+
   async getStatus(): Promise<ModuleStatus> {
     try {
       const email = await antigravityAuth.getAccountEmail()
+      let balanceText = '已授权反重力账号'
+      try {
+        const liveStatus = await this.fetchLiveUserStatus()
+        if (liveStatus?.userTier?.name) {
+          balanceText = liveStatus.userTier.name
+          const credits = liveStatus.planStatus?.planInfo?.monthlyPromptCredits
+          if (typeof credits === 'number') {
+            balanceText += ` (${credits.toLocaleString()} Credits)`
+          }
+        }
+      } catch {}
+
       return {
         online: true,
         account: email || '已登录反重力',
-        balance: '无限 / 免费版 (个人订阅)',
+        balance: balanceText,
       }
     } catch (err: any) {
       return {

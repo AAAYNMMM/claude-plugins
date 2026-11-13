@@ -209,17 +209,29 @@ async function doSyncGatewayRoutes(
     return 0
   })
 
+  // 最佳合规别名首选映射：使 Claude 桌面端自动挂载原生 Thinking Effort 滑块与多模态能力
+  const PREFERRED_ALIASES: Record<string, string> = {
+    'gemini-3.8-flash-high': 'claude-fable-5-2',
+    'claude-sonnet-4-6': 'claude-sonnet-5-5',
+    'claude-opus-4-6': 'claude-opus-5-5',
+    'gpt-oss-120b': 'claude-haiku-5-5',
+  }
+
   let aliasIdx = 0
   for (const item of aggregated) {
     const { module: modId, model } = item
     if (modId === 'passthrough') continue
 
-    while (aliasIdx < COMPLIANT_ALIASES.length && usedAliases.has(COMPLIANT_ALIASES[aliasIdx])) {
-      aliasIdx++
+    // 优先采用针对性合规别名，次选池中顺位别名
+    let alias = PREFERRED_ALIASES[model.id]
+    if (!alias || usedAliases.has(alias) || !COMPLIANT_ALIASES.includes(alias)) {
+      while (aliasIdx < COMPLIANT_ALIASES.length && usedAliases.has(COMPLIANT_ALIASES[aliasIdx])) {
+        aliasIdx++
+      }
+      if (aliasIdx >= COMPLIANT_ALIASES.length) break
+      alias = COMPLIANT_ALIASES[aliasIdx++]
     }
-    if (aliasIdx >= COMPLIANT_ALIASES.length) break
 
-    const alias = COMPLIANT_ALIASES[aliasIdx++]
     usedAliases.add(alias)
     newRoutes[alias] = {
       module: modId,
