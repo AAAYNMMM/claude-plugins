@@ -13,7 +13,7 @@
   - `modules/workbuddy`：WorkBuddy 桥接模块，包含凭据刷新、OpenAI shim 以及**附属余额/积分查询**小模块。
   - `modules/antigravity`：反重力代理模块，提供 Gemini 3.8 Flash、Gemini 3.8 Pro 等核心模型的 Anthropic Messages API 实时转换与流式输出。
   - `modules/passthrough`：直连透传模块，原生转发至 DeepSeek 官方 Anthropic 兼容端点。
-- **即开即用**：
-  - 双击 `开启网关(切换为网关代理).bat` 立即接入；
-  - 双击 `关闭网关(还原原本代理).bat` 随时一键还原；
-  - 双击 `查看网关与模块状态.bat` 随时查看各模块运行状况与余额。
+- **开关与插件启用状态联动**：
+  - 在 Claude 桌面端**启用** `agent-gateway` 插件（或运行 `开启网关并接入Claude.bat`）：启动网关并自动同步可用模型、接入桌面端与 CLI；
+  - 在 Claude 桌面端**禁用/关闭** `agent-gateway` 插件（或运行 `关闭网关并还原Claude.bat`）：自动停止后台网关、还原原本代理与模型配置，并清理桌面端网关注入条目；
+  - 双击 `查看网关与算力状态.bat` 随时查看各模块运行状况与余额。

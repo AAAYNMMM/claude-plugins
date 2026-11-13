@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import { existsSync, readdirSync, readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
@@ -77,12 +78,30 @@ export const FALLBACK_ANTIGRAVITY_MODELS: AntigravityModelConfig[] = [
   },
 ]
 
+const PROJECT_CACHE_TTL_MS = 10 * 60 * 1000
+
 let cachedModels: AntigravityModelConfig[] | null = null
 let cachedAt = 0
-let cachedProjectId: string | null = null
+let cachedModelsTokenKey: string | null = null
+let cachedProjectEntry: { tokenKey: string; projectId: string; cachedAt: number } | null = null
 const dynamicUpstreamMap = new Map<string, string>()
 const dynamicMaxOutputMap = new Map<string, number>()
 const dynamicQuotaMap = new Map<string, number>()
+
+function tokenFingerprint(accessToken: string | null | undefined): string {
+  if (!accessToken) return ''
+  return createHash('sha256').update(accessToken).digest('hex').slice(0, 16)
+}
+
+export function invalidateAntigravityModelCaches(): void {
+  cachedModels = null
+  cachedAt = 0
+  cachedModelsTokenKey = null
+  cachedProjectEntry = null
+  dynamicUpstreamMap.clear()
+  dynamicMaxOutputMap.clear()
+  dynamicQuotaMap.clear()
+}
 
 /**
  * 读取本地 Antigravity IDE 版本（优先 daemon hub 文件，其次安装包 package.json）。
@@ -145,8 +164,14 @@ export async function fetchLiveProjectAndTier(
   accessToken: string,
   forceRefresh = false
 ): Promise<{ projectId: string; tierName?: string }> {
-  if (cachedProjectId && !forceRefresh) {
-    return { projectId: cachedProjectId }
+  const tokenKey = tokenFingerprint(accessToken)
+  if (
+    !forceRefresh &&
+    cachedProjectEntry &&
+    cachedProjectEntry.tokenKey === tokenKey &&
+    Date.now() - cachedProjectEntry.cachedAt < PROJECT_CACHE_TTL_MS
+  ) {
+    return { projectId: cachedProjectEntry.projectId }
   }
 
   try {
@@ -172,17 +197,25 @@ export async function fetchLiveProjectAndTier(
 
     if (res.ok) {
       const data = (await res.json()) as any
-      const projectId =
+      const liveProjectId =
         typeof data?.cloudaicompanionProject === 'string' && data.cloudaicompanionProject.trim()
           ? data.cloudaicompanionProject.trim()
-          : DEFAULT_PROJECT_ID
-      cachedProjectId = projectId
+          : ''
+      const projectId = liveProjectId || DEFAULT_PROJECT_ID
+      // 仅当上游返回真实 projectId 时才写入账号绑定缓存，绝不缓存兜底默认值
+      if (liveProjectId) {
+        cachedProjectEntry = { tokenKey, projectId: liveProjectId, cachedAt: Date.now() }
+      }
       const tierName = data?.paidTier?.name || data?.currentTier?.name || undefined
       return { projectId, tierName }
     }
   } catch {}
 
-  return { projectId: cachedProjectId || DEFAULT_PROJECT_ID }
+  const sameAccountCached =
+    cachedProjectEntry && cachedProjectEntry.tokenKey === tokenKey
+      ? cachedProjectEntry.projectId
+      : undefined
+  return { projectId: sameAccountCached || DEFAULT_PROJECT_ID }
 }
 
 function inferModelDescription(id: string, name: string, isDefault: boolean, idx: number): string {
@@ -197,21 +230,22 @@ function inferModelDescription(id: string, name: string, isDefault: boolean, idx
 
 function parseAvailableModelsResponse(data: RawAvailableModelsResponse): AntigravityModelConfig[] {
   const modelsMap = data.models || {}
-  dynamicUpstreamMap.clear()
-  dynamicMaxOutputMap.clear()
+  const nextUpstreamMap = new Map<string, string>()
+  const nextMaxOutputMap = new Map<string, number>()
+  const nextQuotaMap = new Map<string, number>()
 
-  // 记录全部启用模型的原始 key 映射，保证指定档位 ID 时也能直接透传
+  // 先在临时 Map 中构建全部启用模型的原始 key 映射
   for (const [id, info] of Object.entries(modelsMap)) {
     if (!info || info.disabled || info.tagTitle === 'Unavailable' || info.isInternal) continue
-    dynamicUpstreamMap.set(id, id)
-    dynamicUpstreamMap.set(id.toLowerCase(), id)
+    nextUpstreamMap.set(id, id)
+    nextUpstreamMap.set(id.toLowerCase(), id)
     if (typeof info.maxOutputTokens === 'number' && info.maxOutputTokens > 0) {
-      dynamicMaxOutputMap.set(id, info.maxOutputTokens)
+      nextMaxOutputMap.set(id, info.maxOutputTokens)
     }
     const frac = info.quotaInfo?.remainingFraction
     if (typeof frac === 'number' && Number.isFinite(frac)) {
-      dynamicQuotaMap.set(id, frac)
-      dynamicQuotaMap.set(id.toLowerCase(), frac)
+      nextQuotaMap.set(id, frac)
+      nextQuotaMap.set(id.toLowerCase(), frac)
     }
   }
 
@@ -303,12 +337,24 @@ function parseAvailableModelsResponse(data: RawAvailableModelsResponse): Antigra
     })
 
     // 同时注册显示名和基础族 ID 到动态映射表
-    dynamicUpstreamMap.set(chosen.id, chosen.id)
-    dynamicUpstreamMap.set(displayName.toLowerCase(), chosen.id)
+    nextUpstreamMap.set(chosen.id, chosen.id)
+    nextUpstreamMap.set(displayName.toLowerCase(), chosen.id)
     const slug = group.baseName.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '')
-    if (slug && !dynamicUpstreamMap.has(slug)) {
-      dynamicUpstreamMap.set(slug, chosen.id)
+    if (slug && !nextUpstreamMap.has(slug)) {
+      nextUpstreamMap.set(slug, chosen.id)
     }
+  }
+
+  // 仅当解析结果非空时才原子替换全部动态映射表（包含清空 dynamicQuotaMap，防止空响应误清旧映射）
+  if (result.length > 0) {
+    dynamicUpstreamMap.clear()
+    for (const [k, v] of nextUpstreamMap) dynamicUpstreamMap.set(k, v)
+
+    dynamicMaxOutputMap.clear()
+    for (const [k, v] of nextMaxOutputMap) dynamicMaxOutputMap.set(k, v)
+
+    dynamicQuotaMap.clear()
+    for (const [k, v] of nextQuotaMap) dynamicQuotaMap.set(k, v)
   }
 
   return result
@@ -367,7 +413,13 @@ export async function getDynamicAntigravityModels(
   accessToken: string | null,
   options: { forceRefresh?: boolean } = {}
 ): Promise<AntigravityModelConfig[]> {
-  if (!options.forceRefresh && cachedModels && Date.now() - cachedAt < CACHE_TTL_MS) {
+  const tokenKey = tokenFingerprint(accessToken)
+  if (
+    !options.forceRefresh &&
+    cachedModels &&
+    cachedModelsTokenKey === tokenKey &&
+    Date.now() - cachedAt < CACHE_TTL_MS
+  ) {
     return cachedModels
   }
 
@@ -387,16 +439,19 @@ export async function getDynamicAntigravityModels(
     if (parsed.length > 0) {
       cachedModels = parsed
       cachedAt = Date.now()
+      cachedModelsTokenKey = tokenKey
       return parsed
     }
   }
 
-  if (cachedModels && cachedModels.length > 0) {
+  if (cachedModels && cachedModels.length > 0 && cachedModelsTokenKey === tokenKey) {
     return cachedModels
   }
 
   for (const m of FALLBACK_ANTIGRAVITY_MODELS) {
-    dynamicUpstreamMap.set(m.id, m.upstreamKey)
+    if (!dynamicUpstreamMap.has(m.id)) {
+      dynamicUpstreamMap.set(m.id, m.upstreamKey)
+    }
   }
   return FALLBACK_ANTIGRAVITY_MODELS
 }

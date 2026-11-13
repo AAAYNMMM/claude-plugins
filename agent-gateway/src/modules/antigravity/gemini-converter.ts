@@ -77,13 +77,16 @@ export function cleanSchemaForGemini(schema: any): Record<string, unknown> {
 
   const cleaned: Record<string, unknown> = {}
 
-  // 1. 类型映射
-  let type = schema.type
-  if (typeof type === 'string') {
-    type = type.toLowerCase()
-    // Gemini 支持: object, string, number, integer, boolean, array
-    cleaned.type = type
-  } else if (!type && schema.properties) {
+  // 1. 类型映射（兼容 JSON Schema 2020-12 类型数组如 ['string', 'null'] 与 'null'）
+  let rawType = schema.type
+  if (Array.isArray(rawType)) {
+    const nonNull = rawType.find((t: unknown) => typeof t === 'string' && t.toLowerCase() !== 'null')
+    rawType = typeof nonNull === 'string' ? nonNull : 'string'
+  }
+  if (typeof rawType === 'string') {
+    const lowered = rawType.toLowerCase()
+    cleaned.type = lowered === 'null' ? 'string' : lowered
+  } else if (!rawType && schema.properties) {
     cleaned.type = 'object'
   }
 
@@ -120,8 +123,10 @@ export function cleanSchemaForGemini(schema: any): Record<string, unknown> {
     }
   }
 
-  // 6. items (用于 array)
-  if (schema.items) {
+  // 6. items (用于 array；tuple 数组取首项清洗以兼容 Gemini 单 Schema 要求)
+  if (Array.isArray(schema.items)) {
+    cleaned.items = schema.items.length > 0 ? cleanSchemaForGemini(schema.items[0]) : { type: 'string' }
+  } else if (schema.items) {
     cleaned.items = cleanSchemaForGemini(schema.items)
   }
 
@@ -160,7 +165,7 @@ export function toGeminiRequest(
   const toolIdToName = new Map<string, string>()
 
   // 预扫描所有已存在的 tool_use 记录
-  for (const msg of req.messages) {
+  for (const msg of req.messages ?? []) {
     if (Array.isArray(msg.content)) {
       for (const part of msg.content) {
         if (part.type === 'tool_use' && (part as any).id && (part as any).name) {
@@ -170,19 +175,24 @@ export function toGeminiRequest(
     }
   }
 
-  // 1. 系统提示词转换
+  // 1. 系统提示词转换（过滤空块，避免空数组或无 text 字段产生空/undefined systemInstruction）
   let systemInstruction: GeminiRequest['systemInstruction'] = undefined
   if (req.system) {
     const sysText = typeof req.system === 'string'
       ? req.system
-      : req.system.map(s => s.text).join('\n\n')
-    systemInstruction = {
-      parts: [{ text: sysText }],
+      : req.system
+          .filter((s: any) => s && typeof s.text === 'string' && s.text.length > 0)
+          .map((s: any) => s.text)
+          .join('\n\n')
+    if (sysText.length > 0) {
+      systemInstruction = {
+        parts: [{ text: sysText }],
+      }
     }
   }
 
   // 2. 对话历史转换（支持图片多模态，并按 Gemini 规范合并相邻同 role 消息）
-  for (const msg of req.messages) {
+  for (const msg of req.messages ?? []) {
     const role: 'user' | 'model' = msg.role === 'assistant' ? 'model' : 'user'
     const parts: GeminiPart[] = []
 
@@ -224,15 +234,21 @@ export function toGeminiRequest(
           const nestedImages: GeminiPart[] = []
           if (typeof c === 'string') {
             try {
-              output = JSON.parse(c)
+              const parsed = JSON.parse(c)
+              output =
+                parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+                  ? (parsed as Record<string, unknown>)
+                  : { result: parsed }
             } catch {
               output = { result: c }
             }
           } else if (Array.isArray(c)) {
             const textParts: string[] = []
             for (const item of c) {
-              if (item.type === 'text' && item.text) textParts.push(item.text)
-              else if (item.type === 'image' && item.source?.type === 'base64' && item.source.data) {
+              if (!item || typeof item !== 'object') continue
+              if (item.type === 'text' && typeof item.text === 'string' && item.text) {
+                textParts.push(item.text)
+              } else if (item.type === 'image' && item.source?.type === 'base64' && item.source.data) {
                 nestedImages.push({
                   inlineData: {
                     mimeType: item.source.media_type || 'image/png',
@@ -244,6 +260,12 @@ export function toGeminiRequest(
             output = { result: textParts.join('\n') }
           } else if (c && typeof c === 'object') {
             output = c
+          } else if (c !== undefined && c !== null) {
+            output = { result: c }
+          }
+
+          if ((part as any).is_error === true) {
+            output = { ...output, is_error: true }
           }
 
           parts.push({
@@ -279,19 +301,26 @@ export function toGeminiRequest(
     }
   }
 
-  // 4. 工具定义转换 (经过深度 schema 清洗，移除 $schema / propertyNames / const 等)
+  // 4. 工具定义转换 (去重并执行深度 schema 清洗)
   let tools: GeminiRequest['tools'] = undefined
   if (req.tools && req.tools.length > 0) {
-    const functionDeclarations = req.tools.map((t: AnthropicTool) => {
-      const cleanedParams = cleanSchemaForGemini(t.input_schema)
-      return {
-        name: t.name,
-        description: t.description || t.name,
-        parameters: cleanedParams,
-      }
-    })
+    const uniqueTools: AnthropicTool[] = []
+    const seenToolNames = new Set<string>()
+    for (const t of req.tools) {
+      if (!t || typeof t.name !== 'string' || !t.name || seenToolNames.has(t.name)) continue
+      seenToolNames.add(t.name)
+      uniqueTools.push(t)
+    }
 
-    tools = [{ functionDeclarations }]
+    const functionDeclarations = uniqueTools.map((t: AnthropicTool) => ({
+      name: t.name,
+      description: t.description?.trim() || t.name,
+      parameters: cleanSchemaForGemini(t.input_schema),
+    }))
+
+    if (functionDeclarations.length > 0) {
+      tools = [{ functionDeclarations }]
+    }
   }
 
   return {

@@ -122,11 +122,15 @@ export type RouteAttemptResult =
   | { committed: true }
   | {
       committed: false
+      aborted?: boolean
       status: number
       retryable: boolean
       retryAfterMs?: number
       errorType?: string
       message: string
+      rawBody?: string
+      rawContentType?: string
+      rawHeaders?: Record<string, string>
     }
 
 export interface GatewayModule {

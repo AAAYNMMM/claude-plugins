@@ -8,6 +8,7 @@ import { execFileSync } from 'node:child_process'
 import { existsSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { invalidateAntigravityModelCaches } from './models.ts'
 
 const curDir = dirname(fileURLToPath(import.meta.url))
 
@@ -26,6 +27,9 @@ export interface AntigravityCredential {
 
 class AntigravityAuthManager {
   private cachedCred: AntigravityCredential | null = null
+  private inflightTokenPromise: Promise<string> | null = null
+  private authGeneration = 0
+  private lastAccountEmail: string | null = null
 
   /**
    * 从 Windows Credential Manager 读取原始凭证
@@ -96,10 +100,13 @@ class AntigravityAuthManager {
     }
 
     const data = (await res.json()) as any
-    const accessToken = data.access_token
-    const expiresIn = typeof data.expires_in === 'number' ? data.expires_in : 3600
+    const accessToken = typeof data?.access_token === 'string' ? data.access_token.trim() : ''
+    if (!accessToken) {
+      throw new Error('Google OAuth 返回空 access_token')
+    }
+    const expiresIn = typeof data.expires_in === 'number' && data.expires_in > 0 ? data.expires_in : 3600
     // 提前 300 秒判定为过期，确保安全边界
-    const expiresAt = Date.now() + (expiresIn - 300) * 1000
+    const expiresAt = Date.now() + Math.max(0, expiresIn - 300) * 1000
 
     return {
       email,
@@ -110,7 +117,17 @@ class AntigravityAuthManager {
   }
 
   /**
-   * 获取可用的 Access Token（支持缓存和自动续期）
+   * 主动使当前认证与关联模型/项目缓存失效（用于 401 重试或外部切号）
+   */
+  invalidate(): void {
+    this.authGeneration += 1
+    this.cachedCred = null
+    this.inflightTokenPromise = null
+    invalidateAntigravityModelCaches()
+  }
+
+  /**
+   * 获取可用的 Access Token（带单飞并发锁、切号清理与自动续期）
    */
   async getAccessToken(): Promise<string> {
     const now = Date.now()
@@ -118,11 +135,32 @@ class AntigravityAuthManager {
       return this.cachedCred.accessToken
     }
 
-    // 重新读取凭据并刷新
-    const { refreshToken, email } = this.readWindowsCredential()
-    const newCred = await this.refreshAccessToken(refreshToken, email)
-    this.cachedCred = newCred
-    return newCred.accessToken
+    if (this.inflightTokenPromise) {
+      return this.inflightTokenPromise
+    }
+
+    const gen = this.authGeneration
+    const promise = (async () => {
+      const { refreshToken, email } = this.readWindowsCredential()
+      if (this.lastAccountEmail !== null && this.lastAccountEmail !== email) {
+        invalidateAntigravityModelCaches()
+      }
+      this.lastAccountEmail = email
+      const newCred = await this.refreshAccessToken(refreshToken, email)
+      if (this.authGeneration === gen) {
+        this.cachedCred = newCred
+      }
+      return newCred.accessToken
+    })()
+
+    this.inflightTokenPromise = promise
+    try {
+      return await promise
+    } finally {
+      if (this.inflightTokenPromise === promise) {
+        this.inflightTokenPromise = null
+      }
+    }
   }
 
   /**

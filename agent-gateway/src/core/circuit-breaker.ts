@@ -54,6 +54,7 @@ export class CircuitBreaker {
   private openDurationMs: number
   private halfOpenRound = 0
   private halfOpenInFlight = 0
+  private halfOpenPermitActive = false
   private lastError?: string
   private config: CircuitBreakerConfig
   readonly key: string
@@ -97,6 +98,7 @@ export class CircuitBreaker {
     }
 
     this.halfOpenInFlight++
+    this.halfOpenPermitActive = true
     const round = this.halfOpenRound
     let released = false
     return {
@@ -105,16 +107,24 @@ export class CircuitBreaker {
       release: () => {
         if (!released && this.halfOpenRound === round) {
           released = true
-          this.halfOpenInFlight = Math.max(0, this.halfOpenInFlight - 1)
+          if (this.halfOpenPermitActive) {
+            this.halfOpenPermitActive = false
+            this.halfOpenInFlight = Math.max(0, this.halfOpenInFlight - 1)
+          }
         }
       },
     }
   }
 
-  recordSuccess(usedHalfOpenPermit: boolean): void {
-    if (usedHalfOpenPermit) {
+  private consumeHalfOpenPermit(usedHalfOpenPermit: boolean): void {
+    if (usedHalfOpenPermit && this.halfOpenPermitActive) {
+      this.halfOpenPermitActive = false
       this.halfOpenInFlight = Math.max(0, this.halfOpenInFlight - 1)
     }
+  }
+
+  recordSuccess(usedHalfOpenPermit: boolean): void {
+    this.consumeHalfOpenPermit(usedHalfOpenPermit)
 
     this.totalRequests++
     this.consecutiveFailures = 0
@@ -132,9 +142,7 @@ export class CircuitBreaker {
     usedHalfOpenPermit: boolean,
     options: { openImmediately?: boolean; cooldownMs?: number; error?: string } = {}
   ): CircuitState {
-    if (usedHalfOpenPermit) {
-      this.halfOpenInFlight = Math.max(0, this.halfOpenInFlight - 1)
-    }
+    this.consumeHalfOpenPermit(usedHalfOpenPermit)
 
     this.totalRequests++
     this.failedRequests++
@@ -182,6 +190,7 @@ export class CircuitBreaker {
     const baseMs = cooldownMs && cooldownMs > 0 ? cooldownMs : this.config.cooldownMs
     this.openDurationMs = Math.max(10_000, Math.min(baseMs, 180_000))
     this.halfOpenInFlight = 0
+    this.halfOpenPermitActive = false
   }
 
   private transitionToHalfOpen(): void {
@@ -189,6 +198,7 @@ export class CircuitBreaker {
     this.state = 'half_open'
     this.halfOpenRound++
     this.halfOpenInFlight = 0
+    this.halfOpenPermitActive = false
     this.consecutiveSuccesses = 0
   }
 
@@ -200,6 +210,7 @@ export class CircuitBreaker {
     this.failedRequests = 0
     this.openedAt = 0
     this.halfOpenInFlight = 0
+    this.halfOpenPermitActive = false
     this.lastError = undefined
   }
 }

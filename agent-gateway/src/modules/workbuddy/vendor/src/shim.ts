@@ -299,7 +299,7 @@ const KIND_STATUS: Readonly<Record<UpstreamErrorKind, number>> = {
   // The host's bounded in-place retry is exactly right for `6020` (the queue is
   // moving), and for `6021`/`6022` the sentence says what to do instead.
   model_queue: 429,
-  not_found: 502,
+  not_found: 404,
   server: 502,
   client: 400,
 }
@@ -673,6 +673,7 @@ class RecoveryStream {
    * the terminator down with it.
    */
   private emitFrame(frame: string): void {
+    if (this.res.writableEnded || this.res.destroyed || this.res.writable === false) return
     if (frame.endsWith('\n\n')) {
       this.res.write(frame)
       return
@@ -732,8 +733,9 @@ class RecoveryStream {
       this.emitContent(flushed.text)
     }
     this.closeWindow()
-    if (!this.sawDone && this.res.writable) this.emitFrame('data: [DONE]\n\n')
-    if (this.res.writable) this.res.end()
+    const canWrite = !this.res.writableEnded && !this.res.destroyed && this.res.writable !== false
+    if (!this.sawDone && canWrite) this.emitFrame('data: [DONE]\n\n')
+    if (!this.res.writableEnded && !this.res.destroyed) this.res.end()
   }
 
   /** Drop held bytes without writing them (used when a retry replaced them). */
@@ -1629,7 +1631,9 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
           writeOpenAIError(res, 500, 'internal', String(error))
         }
       } else {
-        res.end()
+        if (!res.writableEnded && !res.destroyed) {
+          res.end()
+        }
       }
     }
   }

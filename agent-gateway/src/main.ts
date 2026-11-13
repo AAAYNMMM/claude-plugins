@@ -3,66 +3,60 @@
  * 启动网关守护进程、模块聚合、路由同步与状态查询。
  */
 
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
-import { execSync, spawn } from 'node:child_process'
+import { existsSync, readFileSync, rmSync, statSync } from 'node:fs'
+import { execFileSync, spawn } from 'node:child_process'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
   DATA_DIR,
+  ORIGINAL_PROVIDER_BACKUP,
   STATUS_FILE,
   applyGatewayToClaude,
   applyGatewayToSettings,
-  extractUserProviderConfig,
+  cleanupLegacyClaudeCommands,
+  getGatewayPluginState,
   loadGatewayConfig,
   logMessage,
   restoreOriginalClaudeProvider,
   restoreOriginalSettings,
   saveGatewayConfig,
+  setGatewayPluginEnabled,
+  writeFileAtomicSync,
 } from './core/config.ts'
+import {
+  checkClaudeProcessRunning,
+  createClaudeLifecycleMonitor,
+  parseListeningPidsForPort,
+  withFileLock,
+} from './core/lifecycle.ts'
 import { ModuleHost } from './core/module-host.ts'
 import { createGatewayServer } from './core/server.ts'
-import type { RouteConfig } from './core/types.ts'
+import type { GatewayConfig, RouteConfig } from './core/types.ts'
+
+const GATEWAY_OP_LOCK = join(DATA_DIR, 'gateway-op.lock')
 
 const command = process.argv[2] ?? 'serve'
 
 /**
- * Claude 桌面端（published.json）官方认可的合规模型别名池（全量认证，支持 Thinking Effort、1M 上下文与图片输入）
- * 严格避开厂商敏感字，并且坚决不虚构不存在的型号名
+ * 全量使用 Claude Sonnet 槽位别名池：
+ * 优先占用官方目录及 CLI 零警告 Sonnet 槽位（claude-sonnet-5-5 / 5 / 4-6 / 4-5-20250929），
+ * 其余模型顺位分配 2 位数版本号槽位（claude-sonnet-5-6 .. 5-99、6-0 .. 6-99），
+ * 完全符合桌面端校验正则且彻底避开特定系列配额与拦截限制。
  */
-const COMPLIANT_ALIASES = [
-  // 官方 main section（支持 5 档 Thinking Effort、多模态图片/PDF、950K 上下文）
-  'claude-opus-5-5',
+const COMPLIANT_ALIASES: string[] = [
   'claude-sonnet-5-5',
-  'claude-fable-5-2',
-  'claude-haiku-5-5',
-  // 官方 overflow section（全部存在于桌面端 published.json 目录中）
-  'claude-fable-5-1',
-  'claude-opus-5',
   'claude-sonnet-5',
-  'claude-fable-5',
-  'claude-opus-4-8',
-  'claude-opus-4-7',
-  'claude-opus-4-6',
   'claude-sonnet-4-6',
-  'claude-haiku-4-5-20251001',
-  'claude-opus-4-1-20250805',
-  'claude-opus-4-5-20251101',
-  // 官方兼容兜底旧代别名
-  'claude-opus-4-1',
   'claude-sonnet-4-5-20250929',
-  'claude-3-7-sonnet-20250219',
-  'claude-3-5-sonnet-20241022',
-  'claude-3-5-sonnet-20240620',
-  'claude-3-5-haiku-20241022',
-  'claude-3-opus-20240229',
-  'claude-3-haiku-20240307',
+  ...Array.from({ length: 94 }, (_, i) => `claude-sonnet-5-${i + 6}`),
+  ...Array.from({ length: 100 }, (_, i) => `claude-sonnet-6-${i}`),
 ]
 
 /**
- * 彻底停止所有后台网关和自启 VBS 循环，避免死灰复燃
+ * 清理 Windows 开机后台静默守护脚本（仅在 off 或插件禁用时调用）
  */
-function stopGatewayDaemons(port: number): void {
+function removeWindowsStartupScripts(): void {
   const startupDir = join(
     process.env.APPDATA || join(homedir(), 'AppData', 'Roaming'),
     'Microsoft',
@@ -74,25 +68,37 @@ function stopGatewayDaemons(port: number): void {
   for (const name of ['AgentGatewayDaemon.vbs', 'ClaudeWorkBuddyGateway.vbs']) {
     rmSync(join(startupDir, name), { force: true })
   }
+}
+
+/**
+ * 彻底停止所有后台网关和残留 VBS 守护进程
+ */
+function stopGatewayDaemons(port: number): void {
+  removeWindowsStartupScripts()
 
   if (process.platform === 'win32') {
     try {
-      execSync(
-        'powershell -NoProfile -Command "Get-CimInstance Win32_Process -Filter \\"Name=\'wscript.exe\'\\" | Where-Object { $_.CommandLine -like \'*Gateway*\' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }"',
-        { stdio: 'ignore' }
+      execFileSync(
+        'powershell.exe',
+        [
+          '-NoProfile',
+          '-NonInteractive',
+          '-Command',
+          "Get-CimInstance Win32_Process -Filter \"Name='wscript.exe'\" | Where-Object { $_.CommandLine -like '*Gateway*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }",
+        ],
+        { stdio: 'ignore', windowsHide: true }
       )
     } catch {}
     try {
-      const out = execSync(`netstat -ano | findstr :${port}`, { encoding: 'utf8' })
-      for (const line of out.trim().split('\n')) {
-        if (!line.includes('LISTENING')) continue
-        const parts = line.trim().split(/\s+/)
-        const pid = Number(parts[parts.length - 1])
-        if (Number.isInteger(pid) && pid > 0 && pid !== process.pid) {
-          try {
-            execSync(`taskkill /F /T /PID ${pid}`, { stdio: 'ignore' })
-          } catch {}
-        }
+      const out = execFileSync('netstat', ['-ano'], { encoding: 'utf8', windowsHide: true })
+      const pids = parseListeningPidsForPort(out, port, process.pid)
+      for (const pid of pids) {
+        try {
+          execFileSync('taskkill', ['/F', '/T', '/PID', String(pid)], {
+            stdio: 'ignore',
+            windowsHide: true,
+          })
+        } catch {}
       }
     } catch {}
   }
@@ -111,42 +117,6 @@ function stopGatewayDaemons(port: number): void {
 }
 
 /**
- * 注册 Windows 开机后台静默守护脚本（仅在 gateway on 状态启用，off 会自动清理）
- */
-function registerWindowsStartup(serverPath: string): void {
-  if (process.platform !== 'win32') return
-  try {
-    const startupDir = join(
-      process.env.APPDATA || join(homedir(), 'AppData', 'Roaming'),
-      'Microsoft',
-      'Windows',
-      'Start Menu',
-      'Programs',
-      'Startup'
-    )
-    mkdirSync(startupDir, { recursive: true })
-    rmSync(join(startupDir, 'ClaudeWorkBuddyGateway.vbs'), { force: true })
-
-    const vbsPath = join(startupDir, 'AgentGatewayDaemon.vbs')
-    const nodeExe = process.execPath.replace(/"/g, '""')
-    const srv = serverPath.replace(/"/g, '""')
-    const vbsContent = [
-      `' Generated by agent-gateway: keep gateway alive silently while enabled`,
-      `Set sh = CreateObject("WScript.Shell")`,
-      `node = "${nodeExe}"`,
-      `server = "${srv}"`,
-      `cmd = Chr(34) & node & Chr(34) & " " & Chr(34) & server & Chr(34)`,
-      `Do`,
-      `  code = sh.Run(cmd & " serve", 0, True)`,
-      `  If code = 0 Then Exit Do`,
-      `  WScript.Sleep 3000`,
-      `Loop`,
-    ].join('\r\n')
-    writeFileSync(vbsPath, vbsContent, 'utf8')
-  } catch {}
-}
-
-/**
  * 启动脱离父 shell 与 Job Object 的后台独立守护进程（防止一次性 CLI/插件命令退出时连带杀死网关）
  */
 function spawnDetachedGateway(serverPath: string): void {
@@ -157,9 +127,13 @@ function spawnDetachedGateway(serverPath: string): void {
       const psScript = [
         `$si = New-CimInstance -ClassName Win32_ProcessStartup -Property @{ ShowWindow = [uint16]0 } -ClientOnly`,
         `$cmd = '"' + '${nodeEsc}' + '" "' + '${srvEsc}' + '" serve'`,
-        `Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = $cmd; ProcessStartupInformation = $si } | Out-Null`,
+        `$res = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = $cmd; ProcessStartupInformation = $si }`,
+        `if ($null -eq $res -or $res.ReturnValue -ne 0 -or -not $res.ProcessId) { exit 1 }`,
       ].join('; ')
-      execSync(`powershell -NoProfile -Command "${psScript.replace(/"/g, '\\"')}"`, { stdio: 'ignore' })
+      execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', psScript], {
+        stdio: 'ignore',
+        windowsHide: true,
+      })
       return
     } catch {}
   }
@@ -170,29 +144,6 @@ function spawnDetachedGateway(serverPath: string): void {
     windowsHide: true,
   })
   child.unref()
-}
-
-/**
- * 检测 Claude 桌面端主进程是否正在运行
- */
-function isClaudeProcessRunning(): boolean {
-  if (process.platform !== 'win32') {
-    try {
-      const out = execSync('pgrep -i claude', { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] })
-      return out.trim().length > 0
-    } catch {
-      return false
-    }
-  }
-  try {
-    const out = execSync('tasklist /FI "IMAGENAME eq claude.exe" /NH', {
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'ignore'],
-    })
-    return out.toLowerCase().includes('claude.exe')
-  } catch {
-    return false
-  }
 }
 
 let activeSyncPromise: Promise<Record<string, RouteConfig>> | null = null
@@ -232,80 +183,41 @@ async function doSyncGatewayRoutes(
     })
   }
 
-  // 读取用户当前配置中的自配模型与上游地址（若存在旧版隔离备份，一并无缝迁回）
-  const userProvider = extractUserProviderConfig()
-  if (userProvider.upstreamBaseUrl) {
-    config.passthrough = {
-      ...config.passthrough,
-      deepseekBaseUrl: userProvider.upstreamBaseUrl,
-    }
-    host.getPassthroughModule().setBaseUrl(userProvider.upstreamBaseUrl)
+  const aggregated = await host.aggregateModels()
+  const eligibleItems = aggregated.filter((item) => item.module !== 'passthrough')
+  if (eligibleItems.length === 0) {
+    return config.routes
   }
 
-  const aggregated = await host.aggregateModels()
   const newRoutes: Record<string, RouteConfig> = {}
   const usedAliases = new Set<string>()
 
-  // 1) 最优先保留并置顶用户原配置中的模型（如 claude-sonnet-5.5 -> deepseek-v4-flash），原样直连透传
-  for (const userModel of userProvider.userModels) {
-    if (usedAliases.has(userModel.name)) continue
-    newRoutes[userModel.name] = {
-      module: 'passthrough',
-      targetModel: userModel.name,
-      label: userModel.labelOverride ?? userModel.name,
-    }
-    usedAliases.add(userModel.name)
-  }
-
-  // 若用户原配置里尚未登记过任何透传模型，再补充内置默认透传条目兜底
-  if (userProvider.userModels.length === 0) {
-    for (const item of aggregated) {
-      if (item.module !== 'passthrough') continue
-      const alias = item.model.recommendedAlias || item.model.id
-      if (usedAliases.has(alias)) continue
-      newRoutes[alias] = {
-        module: 'passthrough',
-        targetModel: item.model.id,
-        label: item.model.labelOverride ?? item.model.name,
-      }
-      usedAliases.add(alias)
-    }
-  }
-
-  // 2) 优先排序网关扩展模型：反重力模型在前，随后 WorkBuddy 主力模型
-  const extensionItems = aggregated.filter((item) => item.module !== 'passthrough')
-  extensionItems.sort((a, b) => {
+  // 优先排序网关扩展模型：反重力模型在前，随后 WorkBuddy 主力模型
+  eligibleItems.sort((a, b) => {
     if (a.module === 'antigravity' && b.module !== 'antigravity') return -1
     if (a.module !== 'antigravity' && b.module === 'antigravity') return 1
     return 0
   })
 
-  // 动态合规别名两阶段分配：
-  // 1) 按模型语义与能力特征（opus / sonnet / flash / flagship）优先匹配 Claude 原生 Thinking 别名，
-  //    避免后续模型抢占 Opus/Sonnet/Flash 专属槽位；
-  // 2) 为其余动态新增模型顺位分配未使用的合规别名，并严格保持上游展示顺序。
+  // 动态合规 Sonnet 槽位两阶段分配：
+  // 1) 为高优先级/旗舰/快模型优先绑定官方目录 Sonnet 槽位 (claude-sonnet-5-5 / 5 / 4-6 / 4-5-20250929)；
+  // 2) 为其余所有动态模型顺位分配 claude-sonnet-5-6, claude-sonnet-5-7, ... 槽位。
   const getPreferredCandidates = (modId: string, model: { id: string; name: string; recommendedAlias?: string }): string[] => {
     const candidates: string[] = []
     if (model.recommendedAlias && COMPLIANT_ALIASES.includes(model.recommendedAlias)) {
       candidates.push(model.recommendedAlias)
     }
     const lower = `${model.id} ${model.name}`.toLowerCase()
-    if (lower.includes('opus')) {
-      candidates.push('claude-opus-5-5', 'claude-opus-5', 'claude-opus-4-8', 'claude-opus-4-7', 'claude-opus-4-6')
+    if (lower.includes('flash') || lower.includes('lite') || lower.includes('haiku')) {
+      candidates.push('claude-sonnet-5-5', 'claude-sonnet-4-6', 'claude-sonnet-4-5-20250929', 'claude-sonnet-5')
+    } else if (lower.includes('opus') || (modId === 'antigravity' && (lower.includes('argon') || lower.includes('hydrogen') || lower.includes('carbon') || lower.includes('pro')))) {
+      candidates.push('claude-sonnet-5', 'claude-sonnet-5-5', 'claude-sonnet-4-6', 'claude-sonnet-4-5-20250929')
     } else if (lower.includes('sonnet')) {
-      candidates.push('claude-sonnet-5-5', 'claude-sonnet-5', 'claude-sonnet-4-6')
-    } else if (lower.includes('flash') || lower.includes('lite') || lower.includes('haiku')) {
-      candidates.push('claude-haiku-5-5', 'claude-haiku-4-5-20251001', 'claude-3-5-haiku-20241022')
-    } else if (
-      modId === 'antigravity' &&
-      (lower.includes('argon') || lower.includes('hydrogen') || lower.includes('carbon') || lower.includes('pro'))
-    ) {
-      candidates.push('claude-fable-5-2', 'claude-fable-5-1', 'claude-fable-5', 'claude-opus-4-8', 'claude-opus-4-7')
+      candidates.push('claude-sonnet-4-6', 'claude-sonnet-5-5', 'claude-sonnet-5', 'claude-sonnet-4-5-20250929')
     }
     return candidates
   }
 
-  const eligibleItems = extensionItems
   const assignedAliases = new Array<string | undefined>(eligibleItems.length)
 
   for (let i = 0; i < eligibleItems.length; i++) {
@@ -340,22 +252,23 @@ async function doSyncGatewayRoutes(
   }
 
   if (Object.keys(newRoutes).length > 0) {
+    // 合并磁盘上可能由 `on` 写入的 passthrough 字段（如 settingsBaseUrl），防止长驻内存对象覆盖掉它们
+    let diskPassthrough: GatewayConfig['passthrough'] | undefined
+    try {
+      diskPassthrough = loadGatewayConfig().passthrough
+    } catch {}
+    config.passthrough = {
+      ...diskPassthrough,
+      ...config.passthrough,
+    }
     config.routes = newRoutes
     saveGatewayConfig(config)
 
-    if (options.updateClaude !== false && userProvider.activePath) {
+    if (options.updateClaude !== false && existsSync(ORIGINAL_PROVIDER_BACKUP)) {
       try {
-        const applied = applyGatewayToClaude(newRoutes, config.port)
-        if (applied.previousBaseUrl) {
-          config.passthrough = {
-            ...config.passthrough,
-            deepseekBaseUrl: applied.previousBaseUrl,
-          }
-          host.getPassthroughModule().setBaseUrl(applied.previousBaseUrl)
-          saveGatewayConfig(config)
-        }
+        const res = applyGatewayToClaude(newRoutes, config.port)
         if (!options.silent) {
-          logMessage(`✓ 已同步更新用户配置中的模型列表（共 ${Object.keys(newRoutes).length} 个模型）`)
+          logMessage(`✓ 已同步更新 Claude 桌面端模型列表（共 ${res.modelCount} 个模型）`)
         }
       } catch (err: any) {
         if (!options.silent) {
@@ -368,26 +281,65 @@ async function doSyncGatewayRoutes(
   return newRoutes
 }
 
-/**
- * 监控 Claude 进程生命周期：网关开启期间持续保活本地端口（避免重启 Claude 时出现 ECONNREFUSED），
- * 每当检测到 Claude 新启动时自动触发模型与配额路由刷新。
- */
-function startClaudeProcessMonitor(log: (msg: string) => void, onClaudeStart: () => void): () => void {
-  let wasRunning = isClaudeProcessRunning()
+function getSelfBuildStamp(selfPath: string): string {
+  try {
+    const st = statSync(selfPath)
+    return `${st.size}:${Math.trunc(st.mtimeMs)}`
+  } catch {
+    return 'unknown'
+  }
+}
 
-  const timer = setInterval(() => {
-    const isRunning = isClaudeProcessRunning()
-    if (!wasRunning && isRunning) {
-      log('检测到 Claude 桌面端启动，自动刷新模型与配额路由...')
-      onClaudeStart()
+function safeLoadConfigForCleanup(): GatewayConfig {
+  try {
+    return loadGatewayConfig()
+  } catch {
+    return {
+      port: 43119,
+      token: '',
+      authMode: 'loopback',
+      defaultModel: 'claude-sonnet-5-5',
+      smallModel: 'claude-sonnet-4-6',
+      routes: {},
+      passthrough: {},
     }
-    wasRunning = isRunning
-  }, 4000)
-
-  return () => clearInterval(timer)
+  }
 }
 
 async function main() {
+  // 0.1 一键关闭网关并还原用户配置里的原本上游地址（保留用户自配模型），优先执行避免损坏 config 阻塞关闭
+  if (command === 'off' || command === 'disable') {
+    await withFileLock(GATEWAY_OP_LOCK, async () => {
+      const cfg = safeLoadConfigForCleanup()
+      process.stdout.write('正在关闭 agent-gateway 网关并还原用户配置...\n')
+      stopGatewayDaemons(cfg.port)
+      cleanupLegacyClaudeCommands()
+
+      let pluginDisabled = false
+      let settingsRestored = false
+      try {
+        pluginDisabled = setGatewayPluginEnabled(false)
+      } catch (err: any) {
+        process.stdout.write(`  警告: 关闭插件状态失败: ${err?.message ?? String(err)}\n`)
+      }
+      try {
+        settingsRestored = restoreOriginalSettings(cfg.token, cfg.passthrough?.settingsBaseUrl)
+      } catch (err: any) {
+        process.stdout.write(`  警告: 还原 CLI settings.json 失败: ${err?.message ?? String(err)}\n`)
+      }
+
+      try {
+        restoreOriginalClaudeProvider(cfg.passthrough?.deepseekBaseUrl)
+        const extras = [settingsRestored ? 'CLI settings.json' : '', pluginDisabled ? '插件状态已关闭' : ''].filter(Boolean)
+        process.stdout.write(`✓ 已移除网关注入条目并还原用户配置${extras.length ? `（${extras.join('，')}）` : ''}！\n`)
+        process.stdout.write(`  提示: 若当前正在桌面端中使用网关，请开启新会话或重启 Claude 桌面端使其生效。\n\n`)
+      } catch (err: any) {
+        process.stdout.write(`  提示: ${err?.message ?? String(err)}\n\n`)
+      }
+    })
+    process.exit(0)
+  }
+
   const config = loadGatewayConfig()
   const host = new ModuleHost()
 
@@ -397,115 +349,161 @@ async function main() {
   if (config.passthrough?.deepseekBaseUrl) {
     host.getPassthroughModule().setBaseUrl(config.passthrough.deepseekBaseUrl)
   }
+  if (config.workbuddy) {
+    host.getWorkBuddyModule().setRegion(config.workbuddy.region)
+    host.getWorkBuddyModule().setChannelPerturbation(config.workbuddy.channelPerturbation)
+  }
 
-  // 0. 一键开启网关并接入 Claude 桌面端
+  // 0. 一键开启网关并接入 Claude 桌面端（受跨进程互斥锁保护，且严格跟随 Claude 桌面端生命周期）
   if (command === 'on' || command === 'enable') {
     const isSilent = process.argv.includes('--silent')
-    let isRunning = false
-    try {
-      const ping = await fetch(`http://127.0.0.1:${config.port}/v1/models`, {
-        signal: AbortSignal.timeout(1000),
-      })
-      if (ping.ok) isRunning = true
-    } catch {}
 
-    const selfPath = fileURLToPath(import.meta.url)
-    registerWindowsStartup(selfPath)
-
-    if (!isRunning) {
-      if (!isSilent) {
-        process.stdout.write(`正在启动后台网关进程 (端口 :${config.port})...\n`)
-      }
-      spawnDetachedGateway(selfPath)
-
-      // 等待服务端口就绪
-      for (let i = 0; i < 25; i++) {
-        await new Promise((r) => setTimeout(r, 200))
-        try {
-          const ping = await fetch(`http://127.0.0.1:${config.port}/v1/models`, {
-            signal: AbortSignal.timeout(500),
-          })
-          if (ping.ok) {
-            isRunning = true
-            break
-          }
-        } catch {}
-      }
-    }
-
-    if (!isSilent) {
-      process.stdout.write('正在同步各模块最新可用模型并构建合规路由...\n')
-    }
-    let currentConfig = loadGatewayConfig()
-    let freshRoutes: Record<string, RouteConfig> | null = null
-    if (isRunning) {
+    await withFileLock(
+      GATEWAY_OP_LOCK,
+      async () => {
+        cleanupLegacyClaudeCommands()
+        removeWindowsStartupScripts()
       try {
-        const syncRes = await fetch(`http://127.0.0.1:${currentConfig.port}/v1/gateway/sync`, {
-          method: 'POST',
-          signal: AbortSignal.timeout(12000),
+        setGatewayPluginEnabled(true)
+      } catch (err: any) {
+        if (!isSilent) {
+          process.stdout.write(`  警告: 启用插件状态失败: ${err?.message ?? String(err)}\n`)
+        }
+      }
+
+      const claudeRunning = await checkClaudeProcessRunning()
+      if (claudeRunning === false) {
+        stopGatewayDaemons(config.port)
+        if (!isSilent) {
+          process.stdout.write(
+            '✓ 已启用 agent-gateway 插件。未检测到运行中的 Claude 桌面端，网关将在打开 Claude 桌面端时自动启动。\n'
+          )
+        }
+        return
+      }
+
+      const selfPath = fileURLToPath(import.meta.url)
+      const expectedStamp = getSelfBuildStamp(selfPath)
+      let isRunning = false
+      let needsRestart = false
+      try {
+        const ping = await fetch(`http://127.0.0.1:${config.port}/health`, {
+          signal: AbortSignal.timeout(1000),
         })
-        if (syncRes.ok) {
-          const syncJson = (await syncRes.json()) as { ok?: boolean; routes?: Record<string, RouteConfig> }
-          if (syncJson.ok && syncJson.routes && Object.keys(syncJson.routes).length > 0) {
-            freshRoutes = syncJson.routes
+        if (ping.ok) {
+          const health = (await ping.json().catch(() => ({}))) as { buildStamp?: string }
+          if (health.buildStamp === expectedStamp) {
+            isRunning = true
+          } else {
+            needsRestart = true
           }
         }
       } catch {}
-    }
-    if (!freshRoutes) {
-      freshRoutes = await syncGatewayRoutes(host, currentConfig, { silent: isSilent })
-    }
 
-    // 直接在用户的 ~/.claude/settings.json 中指向本地网关并清理历史强制覆盖模型，不搞独立配置
-    applyGatewayToSettings(currentConfig.port, currentConfig.token, currentConfig)
-
-    try {
-      const res = applyGatewayToClaude(freshRoutes, currentConfig.port)
-      if (res.previousBaseUrl) {
-        currentConfig.passthrough = {
-          ...currentConfig.passthrough,
-          deepseekBaseUrl: res.previousBaseUrl,
+      if (needsRestart) {
+        if (!isSilent) {
+          process.stdout.write('检测到旧版本网关正在运行，正在重启至最新版本...\n')
         }
-        saveGatewayConfig(currentConfig)
+        stopGatewayDaemons(config.port)
+        for (let i = 0; i < 15; i++) {
+          await new Promise((r) => setTimeout(r, 150))
+          try {
+            await fetch(`http://127.0.0.1:${config.port}/health`, {
+              signal: AbortSignal.timeout(250),
+            })
+          } catch {
+            break
+          }
+        }
       }
+
+      if (!isRunning) {
+        if (!isSilent) {
+          process.stdout.write(`正在启动后台网关进程 (端口 :${config.port})...\n`)
+        }
+        spawnDetachedGateway(selfPath)
+
+        // 等待服务端口就绪（服务端先绑定端口再初始化模块，正常在几百毫秒内就绪）
+        for (let i = 0; i < 35; i++) {
+          await new Promise((r) => setTimeout(r, 200))
+          try {
+            const ping = await fetch(`http://127.0.0.1:${config.port}/health`, {
+              signal: AbortSignal.timeout(500),
+            })
+            if (ping.ok) {
+              isRunning = true
+              break
+            }
+          } catch {}
+        }
+      }
+
       if (!isSilent) {
-        process.stdout.write(`\n✓ agent-gateway 网关已成功开启并写入用户配置！\n`)
-        process.stdout.write(`  网关监听: http://127.0.0.1:${currentConfig.port}\n`)
-        process.stdout.write(`  已写入模型: ${res.modelCount} 个（已保留用户原有自配模型）\n`)
-        process.stdout.write(`  提示: 若当前 Claude 桌面端正在运行，重启桌面端即可生效最新模型。\n\n`)
+        process.stdout.write('正在同步各模块最新可用模型并构建合规路由...\n')
       }
-    } catch (err: any) {
-      if (!isSilent) {
-        process.stdout.write(`\n✓ agent-gateway 网关运行正常 (端口 :${currentConfig.port})\n`)
-        process.stdout.write(`  桌面端接入提示: ${err.message}\n\n`)
+
+      let freshRoutes: Record<string, RouteConfig> | null = null
+      if (isRunning) {
+        try {
+          const syncRes = await fetch(`http://127.0.0.1:${config.port}/v1/gateway/sync`, {
+            method: 'POST',
+            signal: AbortSignal.timeout(12000),
+          })
+          if (syncRes.ok) {
+            const syncJson = (await syncRes.json()) as { ok?: boolean; routes?: Record<string, RouteConfig> }
+            if (syncJson.ok && syncJson.routes && Object.keys(syncJson.routes).length > 0) {
+              freshRoutes = syncJson.routes
+            }
+          }
+        } catch {}
       }
-    }
+      // 仅非静默手动执行且守护未就绪时才在本地进程内执行兜底初始化，避免 SessionStart 超时后短命进程重拉完整模块
+      if (!freshRoutes && !isSilent) {
+        freshRoutes = await syncGatewayRoutes(host, config, { silent: false })
+      }
+
+      // 必须在 sync 之后重新加载磁盘配置，避免旧内存对象覆盖刚同步的 routes
+      const latestConfig = loadGatewayConfig()
+      const routesToApply = freshRoutes && Object.keys(freshRoutes).length > 0 ? freshRoutes : latestConfig.routes
+      const routeAliases = Object.keys(routesToApply)
+      const primaryAlias = routeAliases[0] ?? 'claude-sonnet-5-5'
+      const smallAlias =
+        routeAliases.find((a) => routesToApply[a]?.targetModel?.toLowerCase().includes('flash')) ??
+        routeAliases[1] ??
+        routeAliases[0] ??
+        'claude-sonnet-4-6'
+
+      try {
+        applyGatewayToSettings(latestConfig.port, latestConfig.token, primaryAlias, smallAlias)
+      } catch (err: any) {
+        if (!isSilent) {
+          process.stdout.write(`  警告: 更新 CLI settings.json 失败: ${err?.message ?? String(err)}\n`)
+        }
+      }
+
+      try {
+        const res = applyGatewayToClaude(routesToApply, latestConfig.port)
+        if (!isSilent) {
+          process.stdout.write(`\n✓ agent-gateway 网关已成功开启并隔离切换用户配置！\n`)
+          process.stdout.write(`  网关监听: http://127.0.0.1:${latestConfig.port}\n`)
+          process.stdout.write(`  已写入模型: ${res.modelCount} 个（原始配置已隔离备份）\n`)
+          process.stdout.write(`  提示: 若当前 Claude 桌面端正在运行，重启桌面端即可生效最新模型。\n\n`)
+        }
+      } catch (err: any) {
+        if (!isSilent) {
+          process.stdout.write(`\n✓ agent-gateway 网关运行正常 (端口 :${latestConfig.port})\n`)
+          process.stdout.write(`  桌面端接入提示: ${err?.message ?? String(err)}\n\n`)
+        }
+      }
+      },
+      { timeoutMs: 30_000 }
+    )
 
     if (isSilent) {
       process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: 'SessionStart' } }))
     }
 
     await host.disposeAll()
-    process.exit(0)
-  }
-
-  // 0.1 一键关闭网关并还原用户配置里的原本上游地址（保留用户自配模型）
-  if (command === 'off' || command === 'disable') {
-    process.stdout.write('正在关闭 agent-gateway 网关并还原用户配置...\n')
-    // 1. 彻底停止所有后台守护与自启 VBS 循环
-    stopGatewayDaemons(config.port)
-
-    // 2. 联动还原 CLI / Code 标签页环境（~/.claude/settings.json）
-    const settingsRestored = restoreOriginalSettings(config.token, config.passthrough?.settingsBaseUrl)
-
-    // 3. 还原桌面端用户配置
-    try {
-      restoreOriginalClaudeProvider(config.passthrough?.deepseekBaseUrl)
-      process.stdout.write(`✓ 已移除网关注入条目并还原用户配置${settingsRestored ? '（含 CLI settings.json）' : ''}！\n`)
-      process.stdout.write(`  提示: 若当前正在桌面端中使用网关，请开启新会话或重启 Claude 桌面端使其生效。\n\n`)
-    } catch (err: any) {
-      process.stdout.write(`  提示: ${err.message}\n\n`)
-    }
     process.exit(0)
   }
 
@@ -584,9 +582,30 @@ async function main() {
     process.exit(0)
   }
 
-  // 4. 默认命令：serve（开启期间持续保活端口并随 Claude 启动自动同步模型，仅在 off 时退出）
+  // 4. 默认命令：serve（严格跟随 Claude 桌面端生命周期：桌面端打开时运行，彻底退出或插件禁用时彻底关闭）
+  removeWindowsStartupScripts()
+  const initialPluginState = getGatewayPluginState()
+  if (!initialPluginState.indeterminate && initialPluginState.disabled) {
+    logMessage('检测到 Claude 桌面端已禁用 agent-gateway 插件，正在还原配置并退出网关...')
+    try {
+      restoreOriginalSettings(config.token, config.passthrough?.settingsBaseUrl)
+    } catch {}
+    try {
+      restoreOriginalClaudeProvider(config.passthrough?.deepseekBaseUrl)
+    } catch {}
+    rmSync(STATUS_FILE, { force: true })
+    process.exit(0)
+  }
+
+  const initialClaudeRunning = await checkClaudeProcessRunning()
+  if (initialClaudeRunning === false) {
+    logMessage('未检测到运行中的 Claude 桌面端，网关跟随桌面端生命周期退出。')
+    rmSync(STATUS_FILE, { force: true })
+    process.exit(0)
+  }
+
   logMessage(`正在启动 agent-gateway (端口 :${config.port})...`)
-  await host.initAll({
+  const initPromise = host.initAll({
     gatewayPort: config.port,
     log: logMessage,
     dataDir: DATA_DIR,
@@ -596,6 +615,8 @@ async function main() {
     config,
     host,
     log: logMessage,
+    buildStamp: getSelfBuildStamp(fileURLToPath(import.meta.url)),
+    readyPromise: initPromise,
     onSyncRequest: () => syncGatewayRoutes(host, config, { silent: true, skipInit: true }),
   })
 
@@ -604,16 +625,19 @@ async function main() {
   } catch (err: any) {
     if (err?.code === 'EADDRINUSE') {
       logMessage(`端口 :${config.port} 已有运行中的网关实例，当前重复进程安全退出。`)
+      await initPromise.catch(() => {})
       await host.disposeAll()
       process.exit(0)
     }
     throw err
   }
 
-  // 端口就绪后立即执行一次全量模型同步与配置更新（启动即自动更新，同时避免阻塞端口绑定触发客户端 ECONNREFUSED）
-  syncGatewayRoutes(host, config, { silent: true, skipInit: true }).catch(() => {})
+  // 端口就绪后等待模块初始化完成即执行一次全量模型同步
+  void initPromise
+    .then(() => syncGatewayRoutes(host, config, { silent: true, skipInit: true }))
+    .catch(() => {})
 
-  writeFileSync(
+  writeFileAtomicSync(
     STATUS_FILE,
     JSON.stringify(
       {
@@ -626,20 +650,60 @@ async function main() {
     )
   )
 
-  const stopClaudeWatcher = startClaudeProcessMonitor(logMessage, () => {
-    syncGatewayRoutes(host, config, { silent: true, skipInit: true }).catch(() => {})
-  })
+  let shuttingDown = false
+  const shutdown = async (restoreOnDisable = false) => {
+    if (shuttingDown) return
+    shuttingDown = true
+    const forceExitTimer = setTimeout(() => {
+      process.exit(0)
+    }, 3000)
+    forceExitTimer.unref?.()
 
-  const shutdown = async () => {
-    logMessage('接收到停机信号，正在停止网关...')
     stopClaudeWatcher()
+    removeWindowsStartupScripts()
+    rmSync(STATUS_FILE, { force: true })
+
+    if (restoreOnDisable) {
+      let latestCfg = config
+      try {
+        latestCfg = loadGatewayConfig()
+      } catch {}
+      try {
+        restoreOriginalSettings(latestCfg.token || config.token, latestCfg.passthrough?.settingsBaseUrl ?? config.passthrough?.settingsBaseUrl)
+      } catch {}
+      try {
+        restoreOriginalClaudeProvider(latestCfg.passthrough?.deepseekBaseUrl ?? config.passthrough?.deepseekBaseUrl)
+      } catch {}
+    } else {
+      logMessage('接收到停机信号，正在彻底停止网关...')
+    }
     await gatewayServer.close()
     await host.disposeAll()
     process.exit(0)
   }
 
-  process.on('SIGINT', shutdown)
-  process.on('SIGTERM', shutdown)
+  const stopClaudeWatcher = createClaudeLifecycleMonitor({
+    pollIntervalMs: 2000,
+    exitConfirmPolls: 2,
+    initialRunning: initialClaudeRunning ?? true,
+    checkPluginState: () => getGatewayPluginState(initialPluginState.registered),
+    onClaudeStart: () => {
+      const st = getGatewayPluginState(initialPluginState.registered)
+      if (!st.indeterminate && !st.disabled) {
+        syncGatewayRoutes(host, config, { silent: true, skipInit: true }).catch(() => {})
+      }
+    },
+    onClaudeExit: () => {
+      void shutdown(false)
+    },
+    onPluginDisabled: () => {
+      void shutdown(true)
+    },
+    log: logMessage,
+  })
+
+  process.on('SIGINT', () => void shutdown(false))
+  process.on('SIGTERM', () => void shutdown(false))
 }
 
 main().catch((err) => {

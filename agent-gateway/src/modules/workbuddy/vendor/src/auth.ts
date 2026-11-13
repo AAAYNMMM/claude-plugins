@@ -1724,8 +1724,12 @@ export class WorkBuddyCredentialStore {
           return
         }
       }
-      await writeVaultEntry(dir, id, credential)
-      entries.set(id, { credential: { ...credential, source: 'dsh' }, refreshedAtMs: Date.now() })
+      try {
+        await writeVaultEntry(dir, id, credential)
+        entries.set(id, { credential: { ...credential, source: 'dsh' }, refreshedAtMs: Date.now() })
+      } catch {
+        // Vault entry write contention/lock timeout must not abort credential discovery.
+      }
     }
     for (const [id, entry] of entries) {
       if (!this.matchesRegion(entry.credential.domain)) continue

@@ -77,6 +77,61 @@ function sleepAbortable(ms: number, signal: AbortSignal): Promise<void> {
   })
 }
 
+const GRPC_TO_HTTP_STATUS: Record<number, number> = {
+  1: 499, // CANCELLED
+  2: 502, // UNKNOWN
+  3: 400, // INVALID_ARGUMENT
+  4: 504, // DEADLINE_EXCEEDED
+  5: 404, // NOT_FOUND
+  6: 409, // ALREADY_EXISTS
+  7: 403, // PERMISSION_DENIED
+  8: 429, // RESOURCE_EXHAUSTED
+  9: 400, // FAILED_PRECONDITION
+  10: 409, // ABORTED
+  11: 400, // OUT_OF_RANGE
+  12: 501, // UNIMPLEMENTED
+  13: 500, // INTERNAL
+  14: 503, // UNAVAILABLE
+  15: 500, // DATA_LOSS
+  16: 401, // UNAUTHENTICATED
+}
+
+const GRPC_NAME_TO_HTTP_STATUS: Record<string, number> = {
+  CANCELLED: 499,
+  UNKNOWN: 502,
+  INVALID_ARGUMENT: 400,
+  DEADLINE_EXCEEDED: 504,
+  NOT_FOUND: 404,
+  ALREADY_EXISTS: 409,
+  PERMISSION_DENIED: 403,
+  RESOURCE_EXHAUSTED: 429,
+  FAILED_PRECONDITION: 400,
+  ABORTED: 409,
+  OUT_OF_RANGE: 400,
+  UNIMPLEMENTED: 501,
+  INTERNAL: 500,
+  UNAVAILABLE: 503,
+  DATA_LOSS: 500,
+  UNAUTHENTICATED: 401,
+}
+
+/** 将 Google/gRPC 流或非流错误对象的 code/status 规范映射到合法 HTTP [100, 599] 状态码 */
+export function normalizeAntigravityErrorStatus(errObj: { code?: unknown; status?: unknown } | null | undefined): number {
+  if (!errObj || typeof errObj !== 'object') return 502
+  const rawCode = typeof errObj.code === 'string' && /^\d+$/.test(errObj.code.trim())
+    ? Number(errObj.code.trim())
+    : errObj.code
+  if (typeof rawCode === 'number' && Number.isInteger(rawCode)) {
+    if (rawCode >= 100 && rawCode <= 599) return rawCode
+    if (rawCode in GRPC_TO_HTTP_STATUS) return GRPC_TO_HTTP_STATUS[rawCode]
+  }
+  if (typeof errObj.status === 'string') {
+    const mapped = GRPC_NAME_TO_HTTP_STATUS[errObj.status.trim().toUpperCase()]
+    if (mapped) return mapped
+  }
+  return 502
+}
+
 export class AntigravityModule implements GatewayModule {
   readonly id = 'antigravity'
   readonly name = '反重力 (Antigravity)'
@@ -100,10 +155,10 @@ export class AntigravityModule implements GatewayModule {
   }
 
   private async acquireSlot(signal: AbortSignal): Promise<void> {
-    if (signal.aborted) {
-      throw new DOMException('Aborted', 'AbortError')
-    }
-    if (this.inFlight >= MAX_CONCURRENT_REQUESTS) {
+    while (this.inFlight >= MAX_CONCURRENT_REQUESTS) {
+      if (signal.aborted) {
+        throw new DOMException('Aborted', 'AbortError')
+      }
       await new Promise<void>((resolve, reject) => {
         const entry = () => {
           signal.removeEventListener('abort', onAbort)
@@ -117,6 +172,9 @@ export class AntigravityModule implements GatewayModule {
         signal.addEventListener('abort', onAbort, { once: true })
         this.waitQueue.push(entry)
       })
+    }
+    if (signal.aborted) {
+      throw new DOMException('Aborted', 'AbortError')
     }
     this.inFlight++
   }
@@ -219,13 +277,27 @@ export class AntigravityModule implements GatewayModule {
       geminiBody.generationConfig.maxOutputTokens = maxAllowedOut
     }
 
-    const payload = {
-      project: projectId,
-      model: upstreamModel,
-      userAgent: 'antigravity',
-      requestType: 'agent',
-      request: geminiBody,
+    const effectiveMaxOut = geminiBody.generationConfig?.maxOutputTokens ?? maxAllowedOut
+    if (
+      effectiveMaxOut &&
+      geminiBody.generationConfig?.thinkingConfig?.thinkingBudget !== undefined &&
+      geminiBody.generationConfig.thinkingConfig.thinkingBudget >= effectiveMaxOut
+    ) {
+      const cap = effectiveMaxOut
+      const adjusted = cap > 1024 ? Math.max(1024, cap - 1024) : cap - 1
+      if (adjusted > 0) {
+        geminiBody.generationConfig.thinkingConfig.thinkingBudget = adjusted
+      } else {
+        delete geminiBody.generationConfig.thinkingConfig
+      }
     }
+
+    let currentProjectId = projectId
+    const buildPayload = () => ({
+      project: currentProjectId,
+      model: upstreamModel,
+      request: geminiBody,
+    })
 
     const isStream = !!request.stream
     const endpoint = isStream
@@ -260,11 +332,20 @@ export class AntigravityModule implements GatewayModule {
               ...(isStream ? { Accept: 'text/event-stream' } : {}),
               'User-Agent': getAntigravityUserAgent(),
             },
-            body: JSON.stringify(payload),
+            body: JSON.stringify(buildPayload()),
             signal: abortCtrl.signal,
           })
         } catch (err: any) {
-          if (abortCtrl.signal.aborted) return { committed: true }
+          if (abortCtrl.signal.aborted || err?.name === 'AbortError') {
+            return {
+              committed: false,
+              aborted: true,
+              status: 499,
+              retryable: false,
+              errorType: 'api_error',
+              message: '客户端已断开连接',
+            }
+          }
           if (attempt === 0) {
             await sleepAbortable(700, abortCtrl.signal)
             continue
@@ -280,8 +361,28 @@ export class AntigravityModule implements GatewayModule {
 
         if (upstreamRes.ok) break
 
-        lastErrText = await upstreamRes.text()
+        lastErrText = await upstreamRes.text().catch(() => '')
         const status = upstreamRes.status
+
+        // 401 时使认证与模型/项目缓存失效并刷新重取一次
+        if (status === 401 && attempt === 0) {
+          this.ctx.log(`反重力鉴权失败 (401) [model: ${upstreamModel}]，清理缓存后刷新凭据重试一次`)
+          antigravityAuth.invalidate()
+          try {
+            accessToken = await antigravityAuth.getAccessToken()
+            const refreshedProject = await fetchLiveProjectAndTier(accessToken, true)
+            currentProjectId = refreshedProject.projectId
+            continue
+          } catch (refreshErr: any) {
+            return {
+              committed: false,
+              status: 401,
+              retryable: true,
+              errorType: 'authentication_error',
+              message: `反重力凭据刷新失败: ${refreshErr?.message ?? String(refreshErr)}`,
+            }
+          }
+        }
 
         if (status === 429) {
           const hintedMs = parseRetryDelayMs(upstreamRes, lastErrText)
@@ -300,8 +401,9 @@ export class AntigravityModule implements GatewayModule {
             continue
           }
 
+          const errSummary = lastErrText.replace(/\s+/g, ' ').trim().slice(0, 200)
           this.ctx.log(
-            `反重力请求限流 (429) [model: ${upstreamModel}, bucket: ${bucket}]，交由路由器切换备用节点`
+            `反重力请求限流 (429) [model: ${upstreamModel}, bucket: ${bucket}]${errSummary ? `: ${errSummary}` : ''}，交由路由器切换备用节点`
           )
           return {
             committed: false,
@@ -355,8 +457,16 @@ export class AntigravityModule implements GatewayModule {
         let lastFinishReason = ''
         let lastBlockReason = ''
         let firstStreamError: { status: number; message: string } | null = null
+        let postStartStreamError: { status: number; message: string } | null = null
+        let turnThoughtSignature: string | undefined
 
         const sendSse = (event: string, data: Record<string, unknown>) => {
+          const rawRes = res as unknown as {
+            writableEnded?: boolean
+            destroyed?: boolean
+            writable?: boolean
+          }
+          if (rawRes.writableEnded || rawRes.destroyed || rawRes.writable === false) return
           res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)
         }
 
@@ -398,7 +508,7 @@ export class AntigravityModule implements GatewayModule {
           if (!parsed || typeof parsed !== 'object') return
 
           if (parsed.error) {
-            const errStatus = Number(parsed.error.code) || 502
+            const errStatus = normalizeAntigravityErrorStatus(parsed.error)
             const errMsg = parsed.error.message || JSON.stringify(parsed.error)
             this.ctx.log(`反重力流内返回错误帧 (${errStatus}) [model: ${upstreamModel}]: ${errMsg}`)
             if (!streamStarted) {
@@ -409,6 +519,7 @@ export class AntigravityModule implements GatewayModule {
                 type: 'error',
                 error: { type: errorTypeForStatus(errStatus), message: errMsg },
               })
+              postStartStreamError = { status: errStatus, message: errMsg }
             }
             return
           }
@@ -452,6 +563,10 @@ export class AntigravityModule implements GatewayModule {
           for (const part of parts) {
             if (!part || typeof part !== 'object') continue
 
+            if (typeof part.thoughtSignature === 'string' && part.thoughtSignature) {
+              turnThoughtSignature = part.thoughtSignature
+            }
+
             // 1. Thinking / Text 内容块（注意：不把 Google thoughtSignature 伪装成 Anthropic signature_delta 发射给客户端，避免解码失败）
             if (typeof part.text === 'string' && part.text.length > 0) {
               if (part.thought === true) {
@@ -493,14 +608,18 @@ export class AntigravityModule implements GatewayModule {
               }
             }
 
-            // 2. 函数调用块 (Tool Use)，并缓存 Google thoughtSignature 供多轮回放
+            // 2. 函数调用块 (Tool Use)，并缓存 Google thoughtSignature（优先取 part 自身，缺失时回退本轮前置 thought 签名）
             if (part.functionCall && typeof part.functionCall === 'object') {
               closeActiveBlock()
               stopReason = 'tool_use'
               currentBlockIndex++
               const toolUseId = `toolu_${randomUUID().replace(/-/g, '').slice(0, 24)}`
-              if (typeof part.thoughtSignature === 'string' && part.thoughtSignature) {
-                this.cacheThoughtSignature(toolUseId, part.thoughtSignature)
+              const fcSig =
+                typeof part.thoughtSignature === 'string' && part.thoughtSignature
+                  ? part.thoughtSignature
+                  : turnThoughtSignature
+              if (fcSig) {
+                this.cacheThoughtSignature(toolUseId, fcSig)
               }
               const argsJson = JSON.stringify(part.functionCall.args ?? {})
               estimatedOutputTokens += Math.max(1, Math.ceil(argsJson.length / 3)) + 10
@@ -569,29 +688,68 @@ export class AntigravityModule implements GatewayModule {
         }
 
         if (reader) {
-          while (true) {
-            const { done, value } = await reader.read()
-            if (done) {
-              sseBuffer += decoder.decode()
-              break
+          try {
+            while (true) {
+              if (abortCtrl.signal.aborted) {
+                await reader.cancel().catch(() => {})
+                return {
+                  committed: false,
+                  aborted: true,
+                  status: 499,
+                  retryable: false,
+                  errorType: 'api_error',
+                  message: '客户端已断开连接',
+                }
+              }
+              const { done, value } = await reader.read()
+              if (done) {
+                sseBuffer += decoder.decode()
+                break
+              }
+              sseBuffer += decoder.decode(value, { stream: true })
+              const lines = sseBuffer.split(/\r?\n/)
+              sseBuffer = lines.pop() ?? ''
+              for (const line of lines) {
+                processLine(line)
+                if (postStartStreamError || firstStreamError) break
+              }
+              if (postStartStreamError || firstStreamError) {
+                await reader.cancel().catch(() => {})
+                break
+              }
             }
-            sseBuffer += decoder.decode(value, { stream: true })
-            const lines = sseBuffer.split(/\r?\n/)
-            sseBuffer = lines.pop() ?? ''
-            for (const line of lines) {
-              processLine(line)
+            if (!postStartStreamError && !firstStreamError && sseBuffer.trim()) {
+              processLine(sseBuffer)
             }
-          }
-          if (sseBuffer.trim()) {
-            processLine(sseBuffer)
+          } catch (readErr) {
+            await reader.cancel().catch(() => {})
+            throw readErr
+          } finally {
+            try {
+              reader.releaseLock()
+            } catch {}
           }
         }
 
+        if (postStartStreamError) {
+          if (!res.writableEnded) res.end()
+          throw new Error(postStartStreamError.message)
+        }
+
         if (!streamStarted && firstStreamError) {
+          let retryAfterMs: number | undefined
+          if (firstStreamError.status === 429) {
+            retryAfterMs = DEFAULT_RETRY_AFTER_SEC * 1000
+            this.bucketRateLimitUntil.set(
+              bucket,
+              Math.max(this.bucketRateLimitUntil.get(bucket) ?? 0, Date.now() + retryAfterMs)
+            )
+          }
           return {
             committed: false,
             status: firstStreamError.status,
             retryable: isRetryableHttpStatus(firstStreamError.status),
+            ...(retryAfterMs ? { retryAfterMs } : {}),
             errorType: errorTypeForStatus(firstStreamError.status),
             message: `反重力流式响应错误 (${firstStreamError.status}): ${firstStreamError.message}`,
           }
@@ -650,7 +808,7 @@ export class AntigravityModule implements GatewayModule {
         // 非流式
         const data = (await upstreamRes.json()) as any
         if (data?.error) {
-          const errStatus = Number(data.error.code) || 502
+          const errStatus = normalizeAntigravityErrorStatus(data.error)
           return {
             committed: false,
             status: errStatus,
@@ -667,8 +825,13 @@ export class AntigravityModule implements GatewayModule {
         const content: Array<Record<string, unknown>> = []
         let stopReason: 'end_turn' | 'tool_use' | 'max_tokens' =
           candidate?.finishReason === 'MAX_TOKENS' ? 'max_tokens' : 'end_turn'
+        let nonStreamTurnThoughtSig: string | undefined
 
         for (const part of parts) {
+          if (!part || typeof part !== 'object') continue
+          if (typeof part.thoughtSignature === 'string' && part.thoughtSignature) {
+            nonStreamTurnThoughtSig = part.thoughtSignature
+          }
           if (typeof part.text === 'string' && part.text) {
             if (part.thought === true) {
               content.push({
@@ -682,8 +845,12 @@ export class AntigravityModule implements GatewayModule {
           if (part.functionCall && typeof part.functionCall === 'object') {
             stopReason = 'tool_use'
             const toolUseId = `toolu_${randomUUID().replace(/-/g, '').slice(0, 24)}`
-            if (typeof part.thoughtSignature === 'string' && part.thoughtSignature) {
-              this.cacheThoughtSignature(toolUseId, part.thoughtSignature)
+            const fcSig =
+              typeof part.thoughtSignature === 'string' && part.thoughtSignature
+                ? part.thoughtSignature
+                : nonStreamTurnThoughtSig
+            if (fcSig) {
+              this.cacheThoughtSignature(toolUseId, fcSig)
             }
             content.push({
               type: 'tool_use',
@@ -733,7 +900,16 @@ export class AntigravityModule implements GatewayModule {
         return { committed: true }
       }
     } catch (err: any) {
-      if (abortCtrl.signal.aborted) return { committed: true }
+      if (abortCtrl.signal.aborted || err?.name === 'AbortError') {
+        return {
+          committed: false,
+          aborted: true,
+          status: 499,
+          retryable: false,
+          errorType: 'api_error',
+          message: '客户端已断开连接',
+        }
+      }
       if (!res.headersSent) {
         return {
           committed: false,

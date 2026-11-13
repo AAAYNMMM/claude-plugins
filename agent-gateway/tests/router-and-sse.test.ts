@@ -1,8 +1,11 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
 import { EventEmitter } from 'node:events'
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import type { ServerResponse } from 'node:http'
+import { join } from 'node:path'
 import { CircuitBreaker } from '../src/core/circuit-breaker.ts'
+import { cleanupLegacyClaudeCommands, getGatewayPluginState, setGatewayPluginEnabled } from '../src/core/config.ts'
 import { GatewayRouter, getTargetBucketKey, isRetryableHttpStatus } from '../src/core/router.ts'
 import { createGatewayServer } from '../src/core/server.ts'
 import type { AnthropicRequest, GatewayConfig, GatewayModule, RequestContext, RouteAttemptResult } from '../src/core/types.ts'
@@ -10,6 +13,7 @@ import { toGeminiRequest } from '../src/modules/antigravity/gemini-converter.ts'
 import { getQuotaBucket } from '../src/modules/antigravity/models.ts'
 import { AntigravityModule } from '../src/modules/antigravity/index.ts'
 import { antigravityAuth } from '../src/modules/antigravity/auth.ts'
+import { WorkBuddyModule } from '../src/modules/workbuddy/index.ts'
 
 class MockServerResponse extends EventEmitter {
   statusCode = 200
@@ -466,6 +470,10 @@ describe('createGatewayServer HTTP /status & routing integration', () => {
         'claude-opus-5-5': { module: 'antigravity', targetModel: 'claude-opus-5-5-medium', label: 'Opus' },
         'claude-haiku-5-5': { module: 'workbuddy', targetModel: 'deepseek-v4-pro', label: 'WB' },
       },
+      failover: {
+        enabled: true,
+        crossModuleFailover: true,
+      },
     }
     const mockAgy: GatewayModule = {
       id: 'antigravity',
@@ -524,6 +532,263 @@ describe('createGatewayServer HTTP /status & routing integration', () => {
       assert.ok(stBody.breakers.some((b: any) => b.key === 'antigravity:bucket:claude' && b.state === 'open'))
     } finally {
       await gw.close()
+    }
+  })
+})
+
+describe('Router auth failover & Claude plugin state sync', () => {
+  it('does not switch models or cross modules by default when failover is omitted', async () => {
+    const calls: string[] = []
+    const router = new GatewayRouter()
+    const cfg: GatewayConfig = {
+      port: 0,
+      token: 'tok',
+      authMode: 'token',
+      defaultModel: 'claude-haiku-5-5',
+      smallModel: 'claude-haiku-5-5',
+      routes: {
+        'claude-haiku-5-5': { module: 'antigravity', targetModel: 'gemini-3.8-flash-medium', label: 'AGY Flash' },
+        'claude-fable-5-2': { module: 'antigravity', targetModel: 'gemini-4-argon-medium', label: 'AGY Argon' },
+        'claude-sonnet-5-5': { module: 'workbuddy', targetModel: 'deepseek-v4-pro', label: 'WB DeepSeek' },
+      },
+    }
+
+    const mockAgy: GatewayModule = {
+      id: 'antigravity',
+      name: 'AGY',
+      description: 'AGY',
+      async init() {},
+      async listModels() { return [] },
+      async getStatus() { return { online: true } },
+      async handleRequest() {},
+      async tryHandleRequest(_req, _res, _ctx, targetModel): Promise<RouteAttemptResult> {
+        calls.push(`antigravity:${targetModel}`)
+        return { committed: false, status: 429, retryable: true, message: 'AGY_ONLY_429' }
+      },
+    }
+
+    const mockWb: GatewayModule = {
+      id: 'workbuddy',
+      name: 'WB',
+      description: 'WB',
+      async init() {},
+      async listModels() { return [] },
+      async getStatus() { return { online: true } },
+      async handleRequest() {},
+      async tryHandleRequest(_req, _res, _ctx, targetModel): Promise<RouteAttemptResult> {
+        calls.push(`workbuddy:${targetModel}`)
+        return { committed: true }
+      },
+    }
+
+    const fakeHost = {
+      getModule: (id: string) => (id === 'antigravity' ? mockAgy : id === 'workbuddy' ? mockWb : undefined),
+    } as any
+
+    const res = new MockServerResponse()
+    await router.dispatchMessage(
+      { model: 'claude-haiku-5-5', messages: [{ role: 'user', content: 'hi' }] },
+      res as unknown as ServerResponse,
+      { req: {} as any, headers: {}, log: () => {} },
+      cfg,
+      fakeHost,
+      () => {}
+    )
+
+    assert.equal(res.statusCode, 429)
+    assert.ok(res.text().includes('AGY_ONLY_429'))
+    assert.deepEqual(calls, ['antigravity:gemini-3.8-flash-medium'])
+  })
+
+  it('stops retrying the same unauthenticated module on 401 and preserves primary 429 error', async () => {
+    const calls: string[] = []
+    const router = new GatewayRouter()
+    const cfg: GatewayConfig = {
+      port: 0,
+      token: 'tok',
+      authMode: 'token',
+      defaultModel: 'claude-opus-5-5',
+      smallModel: 'claude-haiku-5-5',
+      routes: {
+        'claude-opus-5-5': { module: 'antigravity', targetModel: 'claude-opus-5-5-medium', label: 'AGY Opus' },
+        'claude-haiku-5-5': { module: 'workbuddy', targetModel: 'deepseek-v4-pro', label: 'WB DeepSeek' },
+        'claude-3-5-haiku-20241022': { module: 'workbuddy', targetModel: 'hy4free', label: 'WB Hy4 Free' },
+      },
+      failover: { enabled: true, maxAttempts: 5, crossModuleFailover: true },
+    }
+
+    const mockAgy: GatewayModule = {
+      id: 'antigravity',
+      name: 'AGY',
+      description: 'AGY',
+      async init() {},
+      async listModels() { return [] },
+      async getStatus() { return { online: true } },
+      async handleRequest() {},
+      async tryHandleRequest(_req, _res, _ctx, targetModel): Promise<RouteAttemptResult> {
+        calls.push(`antigravity:${targetModel}`)
+        return { committed: false, status: 429, retryable: true, message: 'AGY_PRIMARY_429' }
+      },
+    }
+
+    const mockWb: GatewayModule = {
+      id: 'workbuddy',
+      name: 'WB',
+      description: 'WB',
+      async init() {},
+      async listModels() { return [] },
+      async getStatus() { return { online: false } },
+      async handleRequest() {},
+      async tryHandleRequest(_req, _res, _ctx, targetModel): Promise<RouteAttemptResult> {
+        calls.push(`workbuddy:${targetModel}`)
+        return { committed: false, status: 401, retryable: true, message: 'WB_401_NOT_SIGNED_IN' }
+      },
+    }
+
+    const fakeHost = {
+      getModule: (id: string) => (id === 'antigravity' ? mockAgy : id === 'workbuddy' ? mockWb : undefined),
+    } as any
+
+    const res = new MockServerResponse()
+    await router.dispatchMessage(
+      { model: 'claude-opus-5-5', messages: [{ role: 'user', content: 'hi' }] },
+      res as unknown as ServerResponse,
+      { req: {} as any, headers: {}, log: () => {} },
+      cfg,
+      fakeHost,
+      () => {}
+    )
+
+    assert.equal(res.statusCode, 429)
+    assert.ok(res.text().includes('AGY_PRIMARY_429'))
+    assert.deepEqual(calls, ['antigravity:claude-opus-5-5-medium', 'workbuddy:deepseek-v4-pro'])
+  })
+
+  it('syncs plugin enabled/disabled state in settings.json and cleans legacy commands', () => {
+    const tmp = mkdtempSync(join(import.meta.dirname, '.tmp-plugin-state-'))
+    try {
+      const settingsPath = join(tmp, 'settings.json')
+      const installedPath = join(tmp, 'installed_plugins.json')
+      const cmdsDir = join(tmp, 'commands')
+      mkdirSync(cmdsDir, { recursive: true })
+      writeFileSync(join(cmdsDir, 'workbuddy-models.md'), 'old', 'utf8')
+      writeFileSync(join(cmdsDir, 'workbuddy-status.md'), 'old', 'utf8')
+      writeFileSync(join(cmdsDir, 'keep-me.md'), 'keep', 'utf8')
+
+      writeFileSync(
+        installedPath,
+        JSON.stringify({ version: 2, plugins: { 'agent-gateway@aaaynmmm-plugins': [{}] } }),
+        'utf8'
+      )
+      writeFileSync(
+        settingsPath,
+        JSON.stringify({ enabledPlugins: { 'agent-gateway@aaaynmmm-plugins': true } }),
+        'utf8'
+      )
+
+      let state = getGatewayPluginState(false, settingsPath, installedPath)
+      assert.equal(state.registered, true)
+      assert.equal(state.enabled, true)
+      assert.equal(state.disabled, false)
+
+      assert.equal(setGatewayPluginEnabled(false, settingsPath, installedPath), true)
+      state = getGatewayPluginState(true, settingsPath, installedPath)
+      assert.equal(state.enabled, false)
+      assert.equal(state.disabled, true)
+
+      assert.equal(setGatewayPluginEnabled(true, settingsPath, installedPath), true)
+      state = getGatewayPluginState(true, settingsPath, installedPath)
+      assert.equal(state.enabled, true)
+      assert.equal(state.disabled, false)
+
+      // Uninstalling plugin after startup also marks state.disabled = true
+      writeFileSync(installedPath, JSON.stringify({ version: 2, plugins: {} }), 'utf8')
+      writeFileSync(settingsPath, JSON.stringify({ enabledPlugins: {} }), 'utf8')
+      state = getGatewayPluginState(true, settingsPath, installedPath)
+      assert.equal(state.disabled, true)
+
+      const removed = cleanupLegacyClaudeCommands(cmdsDir)
+      assert.equal(removed.length, 2)
+      assert.equal(existsSync(join(cmdsDir, 'workbuddy-models.md')), false)
+      assert.equal(existsSync(join(cmdsDir, 'workbuddy-status.md')), false)
+      assert.equal(existsSync(join(cmdsDir, 'keep-me.md')), true)
+    } finally {
+      rmSync(tmp, { recursive: true, force: true })
+    }
+  })
+
+  it('initializes WorkBuddyModule with valid region resolution and shim without crashing', async () => {
+    const mod = new WorkBuddyModule()
+    mod.setRegion('auto')
+    await mod.init({ gatewayPort: 0, log: () => {}, dataDir: '' })
+    try {
+      const models = await mod.listModels()
+      assert.ok(models.length > 0)
+    } finally {
+      await mod.dispose()
+    }
+  })
+
+  it('sends flat OpenAI body with model field to WorkBuddy shim and converts SSE for both stream and non-stream', async () => {
+    const mod = new WorkBuddyModule()
+    mod.setRegion('cn')
+    const capturedBodies: Array<Record<string, unknown>> = []
+    const origFetch = globalThis.fetch
+
+    // Mock only the WorkBuddy upstream or shim? Wait: shim runs on 127.0.0.1, so we stub globalThis.fetch
+    // for shimUrl so we verify the exact body WorkBuddyModule sends AND the SSE -> Anthropic conversion!
+    await mod.init({ gatewayPort: 0, log: () => {}, dataDir: '' })
+    try {
+      globalThis.fetch = (async (input: string | URL, init?: RequestInit) => {
+        const url = String(input)
+        if (url.includes('/v1/chat/completions')) {
+          capturedBodies.push(JSON.parse(String(init?.body ?? '{}')))
+          const sse = [
+            `data: ${JSON.stringify({ choices: [{ delta: { content: 'wb-ok' } }] })}\n\n`,
+            `data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: 'stop' }], usage: { prompt_tokens: 5, completion_tokens: 2 } })}\n\n`,
+            'data: [DONE]\n\n',
+          ].join('')
+          return new Response(sse, {
+            status: 200,
+            headers: { 'Content-Type': 'text/event-stream' },
+          })
+        }
+        return origFetch(input, init)
+      }) as typeof fetch
+
+      // 1. Non-stream Anthropic request
+      const resJson = new MockServerResponse()
+      const r1 = await mod.tryHandleRequest(
+        { model: 'claude-haiku-5-5', max_tokens: 64, stream: false, messages: [{ role: 'user', content: 'hi' }] },
+        resJson as unknown as ServerResponse,
+        { req: {} as any, headers: {}, log: () => {} },
+        'deepseek-v4-flash'
+      )
+      assert.equal(r1.committed, true)
+      assert.equal(capturedBodies[0]?.['model'], 'deepseek-v4-flash')
+      assert.equal(capturedBodies[0]?.['body'], undefined)
+      const jsonOut = JSON.parse(resJson.text())
+      assert.equal(jsonOut.type, 'message')
+      assert.equal(jsonOut.model, 'claude-haiku-5-5')
+      assert.equal(jsonOut.content[0].text, 'wb-ok')
+
+      // 2. Stream Anthropic request
+      const resSse = new MockServerResponse()
+      const r2 = await mod.tryHandleRequest(
+        { model: 'claude-opus-5-5', max_tokens: 64, stream: true, messages: [{ role: 'user', content: 'hi' }] },
+        resSse as unknown as ServerResponse,
+        { req: {} as any, headers: {}, log: () => {} },
+        'deepseek-v4-pro'
+      )
+      assert.equal(r2.committed, true)
+      assert.equal(resSse.writableEnded, true)
+      assert.equal(capturedBodies[1]?.['model'], 'deepseek-v4-pro')
+      assert.ok(resSse.text().includes('"model":"claude-opus-5-5"'))
+      assert.ok(resSse.text().includes('"text":"wb-ok"'))
+      assert.ok(resSse.text().includes('event: message_stop'))
+    } finally {
+      globalThis.fetch = origFetch
+      await mod.dispose()
     }
   })
 })

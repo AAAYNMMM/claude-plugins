@@ -57,16 +57,17 @@ function classifyModelTier(modelName: string): 'fast' | 'flagship' | 'balanced' 
 
 export class GatewayRouter {
   private readonly breakers = new Map<string, CircuitBreaker>()
+  private readonly fallbackProbeInFlight = new Set<string>()
 
   private getConfigOptions(config: GatewayConfig) {
     const f = config.failover ?? {}
     return {
-      enabled: f.enabled !== false,
+      enabled: f.enabled === true,
       maxAttempts: Math.max(1, f.maxAttempts ?? 4),
       failureThreshold: Math.max(1, f.failureThreshold ?? 2),
       successThreshold: Math.max(1, f.successThreshold ?? 1),
       cooldownMs: Math.max(10_000, (f.cooldownSeconds ?? 45) * 1000),
-      crossModuleFailover: f.crossModuleFailover !== false,
+      crossModuleFailover: f.crossModuleFailover === true,
     }
   }
 
@@ -191,11 +192,14 @@ export class GatewayRouter {
       const wbRoutes = registeredRoutes.filter((r) => r.module === 'workbuddy')
       const preferredOrder =
         tier === 'fast'
-          ? ['deepseek-v4.1-flash', 'hy4free', 'glm-5.3-flash', 'hy3']
-          : ['deepseek-v4-pro', 'glm-5.3', 'hy4std', 'hy4free']
+          ? ['deepseek-v4-flash', 'hy3', 'glm-5v-turbo', 'glm-5.1']
+          : ['deepseek-v4-pro', 'glm-5.3', 'kimi-k3-1', 'deepseek-v4-flash']
       for (const id of preferredOrder) {
         const match = wbRoutes.find((r) => r.targetModel === id)
         if (match) pushCandidate(match.module, match.targetModel, match.label ?? id)
+      }
+      for (const r of wbRoutes) {
+        pushCandidate(r.module, r.targetModel, r.label ?? r.targetModel ?? 'WorkBuddy')
       }
     }
 
@@ -205,8 +209,8 @@ export class GatewayRouter {
         const wbRoutes = registeredRoutes.filter((r) => r.module === 'workbuddy')
         const preferredOrder =
           tier === 'fast'
-            ? ['deepseek-v4.1-flash', 'hy4free', 'glm-5.3-flash', 'hy3']
-            : ['deepseek-v4-pro', 'glm-5.3', 'kimi-k3-1', 'hy4free']
+            ? ['deepseek-v4-flash', 'hy3', 'glm-5v-turbo', 'deepseek-v4-pro']
+            : ['deepseek-v4-pro', 'glm-5.3', 'kimi-k3-1', 'deepseek-v4-flash']
         for (const id of preferredOrder) {
           const match = wbRoutes.find((r) => r.targetModel === id)
           if (match) {
@@ -261,27 +265,28 @@ export class GatewayRouter {
     let attempted = 0
     let lastFailure: Extract<RouteAttemptResult, { committed: false }> | null = null
     const failedBuckets = new Set<string>()
+    const failedModules = new Set<string>()
 
     for (const candidate of candidates) {
       if (attempted >= opts.maxAttempts) break
-      // 若同一 Antigravity 配额桶本轮已失败（例如刚 429），直接跳过同桶其他变体，避免重复踩雷
-      if (!candidate.isPrimary && failedBuckets.has(candidate.bucketKey)) {
+      // 若同一 Antigravity 配额桶本轮已失败（例如刚 429），或整模块认证失效（401/403），跳过同组其他节点
+      if (!candidate.isPrimary && (failedBuckets.has(candidate.bucketKey) || failedModules.has(candidate.moduleId))) {
         continue
       }
 
       const mod = host.getModule(candidate.moduleId)
       if (!mod) continue
 
-      const targetBreaker = this.getOrCreateBreaker(candidate.targetKey, config)
+      const targetBreaker = opts.enabled ? this.getOrCreateBreaker(candidate.targetKey, config) : null
       const bucketBreaker =
-        candidate.bucketKey !== candidate.targetKey
+        opts.enabled && candidate.bucketKey !== candidate.targetKey
           ? this.getOrCreateBreaker(candidate.bucketKey, config)
           : null
 
       let targetPermit = { allowed: true, usedHalfOpenPermit: false, release: () => {} }
       let bucketPermit = { allowed: true, usedHalfOpenPermit: false, release: () => {} }
 
-      if (!bypassBreakers) {
+      if (!bypassBreakers && targetBreaker) {
         if (!targetBreaker.isAvailable() || (bucketBreaker && !bucketBreaker.isAvailable())) {
           continue
         }
@@ -307,9 +312,17 @@ export class GatewayRouter {
 
       try {
         const result = await this.invokeModule(mod, request, res, reqContext, candidate.targetModel)
+        if (!result.committed && result.aborted) {
+          targetPermit.release()
+          bucketPermit.release()
+          if (!res.writableEnded) res.end()
+          return
+        }
         if (result.committed) {
-          targetBreaker.recordSuccess(targetPermit.usedHalfOpenPermit)
-          bucketBreaker?.recordSuccess(bucketPermit.usedHalfOpenPermit)
+          if (opts.enabled && targetBreaker) {
+            targetBreaker.recordSuccess(targetPermit.usedHalfOpenPermit)
+            bucketBreaker?.recordSuccess(bucketPermit.usedHalfOpenPermit)
+          }
           return
         }
 
@@ -318,45 +331,77 @@ export class GatewayRouter {
           targetPermit.release()
           bucketPermit.release()
           if (!res.headersSent) {
-            res.statusCode = result.status || 400
-            res.setHeader('Content-Type', 'application/json')
-            res.end(errorPayload(result.errorType ?? errorTypeForStatus(result.status), result.message))
+            this.writeFailureResponse(res, result)
+          } else if (!res.writableEnded) {
+            res.end()
           }
           return
         }
 
         // 上游可转移故障（429 / 5xx / 认证失效等）：记录失败，429 立即熔断本配额桶并切换下家
         const isRateLimit = result.status === 429
-        targetBreaker.recordFailure(targetPermit.usedHalfOpenPermit, {
-          openImmediately: isRateLimit,
-          cooldownMs: result.retryAfterMs,
-          error: result.message,
-        })
-        bucketBreaker?.recordFailure(bucketPermit.usedHalfOpenPermit, {
-          openImmediately: isRateLimit,
-          cooldownMs: result.retryAfterMs,
-          error: result.message,
-        })
+        const isAuthFailure = result.status === 401 || result.status === 403
+        if (opts.enabled && targetBreaker) {
+          targetBreaker.recordFailure(targetPermit.usedHalfOpenPermit, {
+            openImmediately: isRateLimit || isAuthFailure,
+            cooldownMs: result.retryAfterMs,
+            error: result.message,
+          })
+          bucketBreaker?.recordFailure(bucketPermit.usedHalfOpenPermit, {
+            openImmediately: isRateLimit || isAuthFailure,
+            cooldownMs: result.retryAfterMs,
+            error: result.message,
+          })
+        } else {
+          targetPermit.release()
+          bucketPermit.release()
+        }
+
+        if (res.headersSent) {
+          if (!res.writableEnded) res.end()
+          return
+        }
+
         if (isRateLimit) {
           failedBuckets.add(candidate.bucketKey)
         }
+        if (isAuthFailure) {
+          failedModules.add(candidate.moduleId)
+        }
 
-        lastFailure = result
+        // 若主节点已返回具体上游错误（如 429），不要被未登录备用节点的 401/403 覆盖错误提示
+        if (candidate.isPrimary || !lastFailure || !isAuthFailure) {
+          lastFailure = result
+        }
         log(
           `[路由熔断] 节点 ${candidate.targetKey} 返回 ${result.status}${
             isRateLimit ? '（配额桶已进入冷却）' : ''
           }，尝试下一可用节点`
         )
       } catch (err: any) {
-        targetPermit.release()
-        bucketPermit.release()
-        if (res.headersSent) {
+        const isAbort =
+          err?.name === 'AbortError' ||
+          (reqContext.req as any)?.aborted ||
+          (reqContext.req as any)?.destroyed ||
+          (res as any)?.destroyed
+        if (isAbort) {
+          targetPermit.release()
+          bucketPermit.release()
           if (!res.writableEnded) res.end()
           return
         }
         const msg = err?.message ?? String(err)
-        targetBreaker.recordFailure(targetPermit.usedHalfOpenPermit, { error: msg })
-        bucketBreaker?.recordFailure(bucketPermit.usedHalfOpenPermit, { error: msg })
+        if (opts.enabled && targetBreaker) {
+          targetBreaker.recordFailure(targetPermit.usedHalfOpenPermit, { error: msg })
+          bucketBreaker?.recordFailure(bucketPermit.usedHalfOpenPermit, { error: msg })
+        } else {
+          targetPermit.release()
+          bucketPermit.release()
+        }
+        if (res.headersSent) {
+          if (!res.writableEnded) res.end()
+          return
+        }
         lastFailure = {
           committed: false,
           status: 502,
@@ -368,39 +413,128 @@ export class GatewayRouter {
       }
     }
 
-    // 若所有节点当前均处于熔断 Open 状态，仍做一次首节点兜底探针，避免客户端完全无法恢复
+    // 若所有节点当前均处于熔断 Open 状态，仍做一次首节点兜底探针（带并发互斥锁，避免惊群）
     if (attempted === 0 && candidates.length > 0) {
       const primary = candidates[0]
       const mod = host.getModule(primary.moduleId)
+      const probeLockKey = primary.bucketKey || primary.targetKey
       if (mod) {
-        log(`[熔断兜底] 所有备用节点均处于冷却状态，放行首节点探测 [${mod.name}] -> ${primary.targetModel ?? '默认'}`)
-        const probe = await this.invokeModule(mod, request, res, reqContext, primary.targetModel)
-        if (probe.committed) {
-          this.getOrCreateBreaker(primary.targetKey, config).reset()
-          if (primary.bucketKey !== primary.targetKey) {
-            this.getOrCreateBreaker(primary.bucketKey, config).reset()
+        if (this.fallbackProbeInFlight.has(probeLockKey)) {
+          lastFailure = {
+            committed: false,
+            status: 429,
+            retryable: true,
+            retryAfterMs: 10_000,
+            errorType: 'rate_limit_error',
+            message: '所有可用模型路由均处于熔断冷却状态（恢复探测正在进行中），请稍后重试',
           }
-          return
+        } else {
+          this.fallbackProbeInFlight.add(probeLockKey)
+          log(`[熔断兜底] 所有备用节点均处于冷却状态，放行首节点探测 [${mod.name}] -> ${primary.targetModel ?? '默认'}`)
+          try {
+            const probe = await this.invokeModule(mod, request, res, reqContext, primary.targetModel)
+            if (!probe.committed && probe.aborted) {
+              if (!res.writableEnded) res.end()
+              return
+            }
+            if (probe.committed) {
+              if (opts.enabled) {
+                this.getOrCreateBreaker(primary.targetKey, config).reset()
+                if (primary.bucketKey !== primary.targetKey) {
+                  this.getOrCreateBreaker(primary.bucketKey, config).reset()
+                }
+              }
+              return
+            }
+            if (opts.enabled && probe.retryable) {
+              const isRateLimit = probe.status === 429
+              const isAuthFailure = probe.status === 401 || probe.status === 403
+              this.getOrCreateBreaker(primary.targetKey, config).recordFailure(false, {
+                openImmediately: isRateLimit || isAuthFailure,
+                cooldownMs: probe.retryAfterMs,
+                error: probe.message,
+              })
+              if (primary.bucketKey !== primary.targetKey) {
+                this.getOrCreateBreaker(primary.bucketKey, config).recordFailure(false, {
+                  openImmediately: isRateLimit || isAuthFailure,
+                  cooldownMs: probe.retryAfterMs,
+                  error: probe.message,
+                })
+              }
+            }
+            if (res.headersSent) {
+              if (!res.writableEnded) res.end()
+              return
+            }
+            lastFailure = probe
+          } catch (err: any) {
+            const isAbort =
+              err?.name === 'AbortError' ||
+              (reqContext.req as any)?.aborted ||
+              (reqContext.req as any)?.destroyed ||
+              (res as any)?.destroyed
+            if (isAbort) {
+              if (!res.writableEnded) res.end()
+              return
+            }
+            const msg = err?.message ?? String(err)
+            if (opts.enabled) {
+              this.getOrCreateBreaker(primary.targetKey, config).recordFailure(false, { error: msg })
+              if (primary.bucketKey !== primary.targetKey) {
+                this.getOrCreateBreaker(primary.bucketKey, config).recordFailure(false, { error: msg })
+              }
+            }
+            if (res.headersSent) {
+              if (!res.writableEnded) res.end()
+              return
+            }
+            lastFailure = {
+              committed: false,
+              status: 502,
+              retryable: true,
+              errorType: 'api_error',
+              message: `模块 [${mod.name}] 兜底探测异常: ${msg}`,
+            }
+          } finally {
+            this.fallbackProbeInFlight.delete(probeLockKey)
+          }
         }
-        lastFailure = probe
       }
     }
 
     if (!res.headersSent) {
-      const status = lastFailure?.status || 503
-      res.statusCode = status
-      res.setHeader('Content-Type', 'application/json')
-      if (status === 429) {
-        const retrySec = Math.max(1, Math.ceil((lastFailure?.retryAfterMs ?? 30_000) / 1000))
-        res.setHeader('Retry-After', String(retrySec))
-      }
-      res.end(
-        errorPayload(
-          lastFailure?.errorType ?? errorTypeForStatus(status),
-          lastFailure?.message ?? '所有可用模型路由均繁忙或已触发限流，请稍后重试'
-        )
-      )
+      this.writeFailureResponse(res, lastFailure)
     }
+  }
+
+  private writeFailureResponse(
+    res: ServerResponse,
+    failure: Extract<RouteAttemptResult, { committed: false }> | null
+  ): void {
+    const rawStatus = failure?.status ?? 503
+    const status = Number.isInteger(rawStatus) && rawStatus >= 100 && rawStatus <= 599 ? rawStatus : 502
+    res.statusCode = status
+    if (failure?.rawHeaders) {
+      for (const [k, v] of Object.entries(failure.rawHeaders)) {
+        if (v !== undefined) res.setHeader(k, v)
+      }
+    }
+    if (status === 429 && !failure?.rawHeaders?.['retry-after']) {
+      const retrySec = Math.max(1, Math.ceil((failure?.retryAfterMs ?? 30_000) / 1000))
+      res.setHeader('Retry-After', String(retrySec))
+    }
+    if (failure?.rawBody !== undefined) {
+      res.setHeader('Content-Type', failure.rawContentType || 'application/json')
+      res.end(failure.rawBody)
+      return
+    }
+    res.setHeader('Content-Type', 'application/json')
+    res.end(
+      errorPayload(
+        failure?.errorType ?? errorTypeForStatus(status),
+        failure?.message ?? '所有可用模型路由均繁忙或已触发限流，请稍后重试'
+      )
+    )
   }
 
   private async invokeModule(
