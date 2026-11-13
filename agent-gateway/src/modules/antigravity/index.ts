@@ -16,26 +16,29 @@ import type {
   ModuleModelInfo,
   ModuleStatus,
   RequestContext,
+  RouteAttemptResult,
   AnthropicRequest,
 } from '../../core/types.ts'
+import { isRetryableHttpStatus } from '../../core/router.ts'
 import {
   ANTIGRAVITY_API_HOST,
   fetchLiveProjectAndTier,
   getAntigravityUserAgent,
   getDynamicAntigravityModels,
   getModelMaxOutputTokens,
+  getQuotaBucket,
   resolveUpstreamModel,
 } from './models.ts'
 import { toGeminiRequest } from './gemini-converter.ts'
 import { errorPayload, errorTypeForStatus } from '../../core/protocol/anthropic.ts'
 import { antigravityAuth } from './auth.ts'
 
-const MAX_CONCURRENT_REQUESTS = 2
-const MIN_DISPATCH_GAP_MS = 250
-const RETRY_BACKOFF_MS = [2500, 5000, 9000, 14000, 20000]
-const MAX_UPSTREAM_RETRIES = RETRY_BACKOFF_MS.length
+const MAX_CONCURRENT_REQUESTS = 1
+const MIN_DISPATCH_GAP_MS = 350
 const MAX_RETRY_DELAY_MS = 25_000
+const MICRO_RETRY_MAX_MS = 2500
 const DEFAULT_RETRY_AFTER_SEC = 30
+const MAX_THOUGHT_SIG_CACHE = 500
 
 /** 从上游响应头或 Google Cloud Code 错误文本中提取建议等待毫秒数 */
 function parseRetryDelayMs(res: Response, errText: string): number | null {
@@ -84,7 +87,17 @@ export class AntigravityModule implements GatewayModule {
   private inFlight = 0
   private waitQueue: Array<() => void> = []
   private nextDispatchAt = 0
-  private rateLimitUntil = 0
+  private readonly bucketRateLimitUntil = new Map<string, number>()
+  private readonly toolThoughtSignatures = new Map<string, string>()
+
+  private cacheThoughtSignature(toolUseId: string, signature: string): void {
+    if (!toolUseId || !signature) return
+    if (this.toolThoughtSignatures.size >= MAX_THOUGHT_SIG_CACHE) {
+      const oldestKey = this.toolThoughtSignatures.keys().next().value
+      if (oldestKey) this.toolThoughtSignatures.delete(oldestKey)
+    }
+    this.toolThoughtSignatures.set(toolUseId, signature)
+  }
 
   private async acquireSlot(signal: AbortSignal): Promise<void> {
     if (signal.aborted) {
@@ -114,9 +127,12 @@ export class AntigravityModule implements GatewayModule {
     if (next) next()
   }
 
-  private async waitDispatchWindow(signal: AbortSignal): Promise<void> {
+  private async waitDispatchWindow(bucket: string, signal: AbortSignal): Promise<void> {
     const now = Date.now()
-    const slotAt = Math.max(now, this.nextDispatchAt, this.rateLimitUntil)
+    const bucketUntil = this.bucketRateLimitUntil.get(bucket) ?? 0
+    // 若冷却窗口大于微重试上限，说明应交给路由器立即切换配额桶，不要在此长时间阻塞
+    const effectiveBucketWait = bucketUntil - now <= MICRO_RETRY_MAX_MS ? bucketUntil : 0
+    const slotAt = Math.max(now, this.nextDispatchAt, effectiveBucketWait)
     this.nextDispatchAt = slotAt + MIN_DISPATCH_GAP_MS
     const waitMs = slotAt - now
     if (waitMs > 0) {
@@ -145,31 +161,55 @@ export class AntigravityModule implements GatewayModule {
   async handleRequest(
     request: AnthropicRequest,
     res: ServerResponse,
-    _context: RequestContext,
+    context: RequestContext,
     targetModel?: string
   ): Promise<void> {
+    const result = await this.tryHandleRequest(request, res, context, targetModel)
+    if (!result.committed && !res.headersSent) {
+      res.statusCode = result.status
+      res.setHeader('Content-Type', 'application/json')
+      if (result.status === 429) {
+        const retryAfterSec = result.retryAfterMs
+          ? Math.max(1, Math.ceil(result.retryAfterMs / 1000))
+          : DEFAULT_RETRY_AFTER_SEC
+        res.setHeader('Retry-After', String(retryAfterSec))
+      }
+      res.end(errorPayload(result.errorType ?? errorTypeForStatus(result.status), result.message))
+    }
+  }
+
+  async tryHandleRequest(
+    request: AnthropicRequest,
+    res: ServerResponse,
+    _context: RequestContext,
+    targetModel?: string
+  ): Promise<RouteAttemptResult> {
     let accessToken: string
     try {
       accessToken = await antigravityAuth.getAccessToken()
     } catch (err: any) {
-      res.statusCode = 401
-      res.setHeader('Content-Type', 'application/json')
-      res.end(
-        errorPayload(
-          'authentication_error',
-          `反重力免密认证失败: ${err.message}。请确保本机已安装并登录反重力 (Antigravity) 桌面端。`
-        )
-      )
-      return
+      return {
+        committed: false,
+        status: 401,
+        retryable: true,
+        errorType: 'authentication_error',
+        message: `反重力免密认证失败: ${err.message}。请确保本机已安装并登录反重力 (Antigravity) 桌面端。`,
+      }
     }
 
     // 确保动态模型映射表与项目 ID 已预热（命中缓存时零额外延迟）
     await getDynamicAntigravityModels(accessToken)
     const rawModel = targetModel || request.model || resolveUpstreamModel('')
     const upstreamModel = resolveUpstreamModel(rawModel)
+    const bucket = getQuotaBucket(upstreamModel)
     const { projectId } = await fetchLiveProjectAndTier(accessToken)
 
-    const geminiBody = toGeminiRequest(request)
+    const geminiBody = toGeminiRequest(request, {
+      thoughtSignatureByToolId: this.toolThoughtSignatures,
+      fallbackThoughtSignature: upstreamModel.toLowerCase().includes('gemini')
+        ? 'skip_thought_signature_validator'
+        : undefined,
+    })
     const maxAllowedOut = getModelMaxOutputTokens(upstreamModel)
     if (
       maxAllowedOut &&
@@ -189,7 +229,7 @@ export class AntigravityModule implements GatewayModule {
 
     const isStream = !!request.stream
     const endpoint = isStream
-      ? `${ANTIGRAVITY_API_HOST}/v1internal:streamGenerateContent`
+      ? `${ANTIGRAVITY_API_HOST}/v1internal:streamGenerateContent?alt=sse`
       : `${ANTIGRAVITY_API_HOST}/v1internal:generateContent`
 
     const abortCtrl = new AbortController()
@@ -208,378 +248,501 @@ export class AntigravityModule implements GatewayModule {
       let upstreamRes: Response | null = null
       let lastErrText = ''
 
-      for (let attempt = 0; attempt <= MAX_UPSTREAM_RETRIES; attempt++) {
-        await this.waitDispatchWindow(abortCtrl.signal)
+      for (let attempt = 0; attempt <= 1; attempt++) {
+        await this.waitDispatchWindow(bucket, abortCtrl.signal)
 
         try {
           upstreamRes = await fetch(endpoint, {
             method: 'POST',
             headers: {
-              'Authorization': `Bearer ${accessToken}`,
+              Authorization: `Bearer ${accessToken}`,
               'Content-Type': 'application/json',
+              ...(isStream ? { Accept: 'text/event-stream' } : {}),
               'User-Agent': getAntigravityUserAgent(),
             },
             body: JSON.stringify(payload),
             signal: abortCtrl.signal,
           })
         } catch (err: any) {
-          if (abortCtrl.signal.aborted) return
-          if (attempt < MAX_UPSTREAM_RETRIES) {
-            const delayMs = 1000 * (attempt + 1) + Math.floor(Math.random() * 400)
-            this.ctx.log(`连接反重力端点异常，${delayMs}ms 后第 ${attempt + 1} 次重试 [model: ${upstreamModel}]: ${err.message}`)
-            await sleepAbortable(delayMs, abortCtrl.signal)
+          if (abortCtrl.signal.aborted) return { committed: true }
+          if (attempt === 0) {
+            await sleepAbortable(700, abortCtrl.signal)
             continue
           }
-          res.statusCode = 502
-          res.setHeader('Content-Type', 'application/json')
-          res.end(errorPayload('api_error', `连接反重力端点失败: ${err.message}`))
-          return
+          return {
+            committed: false,
+            status: 502,
+            retryable: true,
+            errorType: 'api_error',
+            message: `连接反重力端点失败: ${err.message}`,
+          }
         }
 
         if (upstreamRes.ok) break
 
         lastErrText = await upstreamRes.text()
         const status = upstreamRes.status
-        const isRetryable = status === 429 || status === 502 || status === 503 || status === 529
 
         if (status === 429) {
           const hintedMs = parseRetryDelayMs(upstreamRes, lastErrText)
-          const scheduledBase = RETRY_BACKOFF_MS[Math.min(attempt, RETRY_BACKOFF_MS.length - 1)]
-          const baseBackoff = scheduledBase + Math.floor(Math.random() * 500)
-          const waitMs = Math.min(hintedMs ?? baseBackoff, MAX_RETRY_DELAY_MS)
-          this.rateLimitUntil = Math.max(this.rateLimitUntil, Date.now() + waitMs)
+          const cooldownMs = Math.max(hintedMs ?? 0, DEFAULT_RETRY_AFTER_SEC * 1000)
+          this.bucketRateLimitUntil.set(
+            bucket,
+            Math.max(this.bucketRateLimitUntil.get(bucket) ?? 0, Date.now() + cooldownMs)
+          )
 
-          if (attempt < MAX_UPSTREAM_RETRIES) {
+          // 参考 cc-switch：仅当上游明确给出极短退避 (<= 2.5s) 时允许一次微重试，否则立即返回交由路由器熔断并切换配额桶
+          if (attempt === 0 && hintedMs !== null && hintedMs <= MICRO_RETRY_MAX_MS) {
             this.ctx.log(
-              `反重力触发限流 (429) [model: ${upstreamModel}]，冷却 ${waitMs}ms 后自动第 ${attempt + 1}/${MAX_UPSTREAM_RETRIES} 次重试`
+              `反重力触发短限流 (429) [model: ${upstreamModel}, bucket: ${bucket}]，等待 ${hintedMs}ms 后微重试一次`
             )
-            await sleepAbortable(waitMs, abortCtrl.signal)
+            await sleepAbortable(hintedMs, abortCtrl.signal)
             continue
           }
-        } else if (isRetryable && attempt < MAX_UPSTREAM_RETRIES) {
-          const waitMs = Math.min(1200 * Math.pow(2, attempt) + Math.floor(Math.random() * 400), MAX_RETRY_DELAY_MS)
+
           this.ctx.log(
-            `反重力上游临时错误 (${status}) [model: ${upstreamModel}]，${waitMs}ms 后自动重试 (${attempt + 1}/${MAX_UPSTREAM_RETRIES})`
+            `反重力请求限流 (429) [model: ${upstreamModel}, bucket: ${bucket}]，交由路由器切换备用节点`
           )
-          await sleepAbortable(waitMs, abortCtrl.signal)
+          return {
+            committed: false,
+            status: 429,
+            retryable: true,
+            retryAfterMs: cooldownMs,
+            errorType: 'rate_limit_error',
+            message: `反重力上游限流 (429): ${lastErrText}`,
+          }
+        }
+
+        const retryable = isRetryableHttpStatus(status)
+        if (retryable && attempt === 0 && (status === 502 || status === 503 || status === 529)) {
+          this.ctx.log(`反重力上游临时错误 (${status}) [model: ${upstreamModel}]，800ms 后重试一次`)
+          await sleepAbortable(800, abortCtrl.signal)
           continue
         }
 
         this.ctx.log(`反重力请求失败 (${status}) [model: ${upstreamModel}]: ${lastErrText}`)
-        res.statusCode = status
-        res.setHeader('Content-Type', 'application/json')
-        if (status === 429) {
-          const hintedMs = parseRetryDelayMs(upstreamRes, lastErrText)
-          const retryAfterSec = hintedMs ? Math.max(1, Math.ceil(hintedMs / 1000)) : DEFAULT_RETRY_AFTER_SEC
-          res.setHeader('Retry-After', String(retryAfterSec))
+        return {
+          committed: false,
+          status,
+          retryable,
+          errorType: errorTypeForStatus(status),
+          message: `反重力上游错误 (${status}): ${lastErrText}`,
         }
-        res.end(
-          errorPayload(errorTypeForStatus(status), `反重力上游错误 (${status}): ${lastErrText}`)
-        )
-        return
       }
 
-      if (!upstreamRes) return
-
-    const messageId = `msg_${randomUUID().replace(/-/g, '')}`
-
-    if (isStream) {
-      // 流式处理：Google streamGenerateContent 返回一个不断输出的 JSON Array
-      // 形如: [ \n { "response": { "candidates": [ ... ] } }, \n { ... } \n ]
-      res.statusCode = 200
-      res.setHeader('Content-Type', 'text/event-stream; charset=utf-8')
-      res.setHeader('Cache-Control', 'no-cache')
-      res.setHeader('Connection', 'keep-alive')
-      if (typeof (res as any).flushHeaders === 'function') (res as any).flushHeaders()
-
-      const sendSse = (event: string, data: Record<string, unknown>) => {
-        res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)
+      if (!upstreamRes) {
+        return {
+          committed: false,
+          status: 502,
+          retryable: true,
+          errorType: 'api_error',
+          message: '反重力上游未返回有效响应',
+        }
       }
 
-      // 1. message_start
-      sendSse('message_start', {
-        type: 'message_start',
-        message: {
-          id: messageId,
-          type: 'message',
-          role: 'assistant',
-          content: [],
-          model: request.model,
-          stop_reason: null,
-          stop_sequence: null,
-          usage: { input_tokens: 0, output_tokens: 0 },
-        },
-      })
+      const messageId = `msg_${randomUUID().replace(/-/g, '')}`
 
-      let currentBlockIndex = -1
-      let activeBlock: 'none' | 'thinking' | 'text' = 'none'
-      let stopReason: 'end_turn' | 'tool_use' | 'max_tokens' = 'end_turn'
-      let totalInputTokens = 0
-      let totalOutputTokens = 0
+      if (isStream) {
+        let streamStarted = false
+        let currentBlockIndex = -1
+        let activeBlock: 'none' | 'thinking' | 'text' = 'none'
+        let stopReason: 'end_turn' | 'tool_use' | 'max_tokens' = 'end_turn'
+        let totalInputTokens = 0
+        let upstreamOutputTokens = 0
+        let estimatedOutputTokens = 0
+        let hasValidFrame = false
+        let emittedVisibleOrTool = false
+        let lastFinishReason = ''
+        let lastBlockReason = ''
+        let firstStreamError: { status: number; message: string } | null = null
 
-      const closeActiveBlock = () => {
-        if (activeBlock !== 'none') {
-          sendSse('content_block_stop', {
-            type: 'content_block_stop',
-            index: currentBlockIndex,
+        const sendSse = (event: string, data: Record<string, unknown>) => {
+          res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)
+        }
+
+        const ensureStreamStarted = () => {
+          if (streamStarted) return
+          streamStarted = true
+          res.statusCode = 200
+          res.setHeader('Content-Type', 'text/event-stream; charset=utf-8')
+          res.setHeader('Cache-Control', 'no-cache')
+          res.setHeader('Connection', 'keep-alive')
+          if (typeof (res as any).flushHeaders === 'function') (res as any).flushHeaders()
+
+          sendSse('message_start', {
+            type: 'message_start',
+            message: {
+              id: messageId,
+              type: 'message',
+              role: 'assistant',
+              content: [],
+              model: request.model,
+              stop_reason: null,
+              stop_sequence: null,
+              usage: { input_tokens: 0, output_tokens: 0 },
+            },
           })
-          activeBlock = 'none'
         }
-      }
 
-      const reader = upstreamRes.body?.getReader()
-      const decoder = new TextDecoder('utf8')
-      let streamBuffer = ''
-
-      if (reader) {
-        while (true) {
-          const { done, value } = await reader.read()
-          if (done) break
-          streamBuffer += decoder.decode(value, { stream: true })
-
-          // 按 JSON 对象边界逐步提取解析
-          while (true) {
-            const startIdx = streamBuffer.indexOf('{\n  "response"') !== -1
-              ? streamBuffer.indexOf('{\n  "response"')
-              : streamBuffer.indexOf('{"response"')
-
-            if (startIdx === -1) {
-              const altIdx = streamBuffer.indexOf('{')
-              if (altIdx === -1) {
-                streamBuffer = ''
-                break
-              }
-              if (altIdx > 0) {
-                streamBuffer = streamBuffer.slice(altIdx)
-              }
-            } else if (startIdx > 0) {
-              streamBuffer = streamBuffer.slice(startIdx)
-            }
-
-            // 寻找闭合的花括号
-            let depth = 0
-            let endIdx = -1
-            let inString = false
-            let escape = false
-
-            for (let i = 0; i < streamBuffer.length; i++) {
-              const ch = streamBuffer[i]
-              if (escape) {
-                escape = false
-                continue
-              }
-              if (ch === '\\') {
-                escape = true
-                continue
-              }
-              if (ch === '"') {
-                inString = !inString
-                continue
-              }
-              if (!inString) {
-                if (ch === '{') depth++
-                else if (ch === '}') {
-                  depth--
-                  if (depth === 0) {
-                    endIdx = i
-                    break
-                  }
-                }
-              }
-            }
-
-            if (endIdx === -1) break
-
-            const jsonStr = streamBuffer.slice(0, endIdx + 1)
-            streamBuffer = streamBuffer.slice(endIdx + 1)
-
-            try {
-              const parsed = JSON.parse(jsonStr)
-              const resp = parsed.response ?? parsed
-              const candidate = resp.candidates?.[0]
-              const parts = candidate?.content?.parts
-
-              // 记录精确 Token 统计
-              if (resp.usageMetadata) {
-                if (typeof resp.usageMetadata.promptTokenCount === 'number') {
-                  totalInputTokens = resp.usageMetadata.promptTokenCount
-                }
-                const candTok = resp.usageMetadata.candidatesTokenCount ?? 0
-                const thoughtTok = resp.usageMetadata.thoughtsTokenCount ?? 0
-                if (candTok + thoughtTok > 0) {
-                  totalOutputTokens = candTok + thoughtTok
-                }
-              }
-
-              // 映射结束原因
-              if (candidate?.finishReason === 'MAX_TOKENS' && stopReason !== 'tool_use') {
-                stopReason = 'max_tokens'
-              }
-
-              if (Array.isArray(parts)) {
-                for (const part of parts) {
-                  // 1. Thinking 思考内容块 vs 正式 Text 文本内容块
-                  if (typeof part.text === 'string' && part.text) {
-                    if (part.thought === true) {
-                      if (activeBlock !== 'thinking') {
-                        closeActiveBlock()
-                        currentBlockIndex++
-                        sendSse('content_block_start', {
-                          type: 'content_block_start',
-                          index: currentBlockIndex,
-                          content_block: { type: 'thinking', thinking: '' },
-                        })
-                        activeBlock = 'thinking'
-                      }
-                      totalOutputTokens += Math.ceil(part.text.length / 3)
-                      sendSse('content_block_delta', {
-                        type: 'content_block_delta',
-                        index: currentBlockIndex,
-                        delta: { type: 'thinking_delta', thinking: part.text },
-                      })
-                      if (typeof part.thoughtSignature === 'string' && part.thoughtSignature) {
-                        sendSse('content_block_delta', {
-                          type: 'content_block_delta',
-                          index: currentBlockIndex,
-                          delta: { type: 'signature_delta', signature: part.thoughtSignature },
-                        })
-                      }
-                    } else {
-                      if (activeBlock !== 'text') {
-                        closeActiveBlock()
-                        currentBlockIndex++
-                        sendSse('content_block_start', {
-                          type: 'content_block_start',
-                          index: currentBlockIndex,
-                          content_block: { type: 'text', text: '' },
-                        })
-                        activeBlock = 'text'
-                      }
-                      totalOutputTokens += Math.ceil(part.text.length / 3)
-                      sendSse('content_block_delta', {
-                        type: 'content_block_delta',
-                        index: currentBlockIndex,
-                        delta: { type: 'text_delta', text: part.text },
-                      })
-                    }
-                  }
-
-                  // 2. 函数调用块 (Tool Use)
-                  if (part.functionCall && typeof part.functionCall === 'object') {
-                    closeActiveBlock()
-
-                    stopReason = 'tool_use'
-                    currentBlockIndex++
-                    const toolUseId = `toolu_${randomUUID().replace(/-/g, '').slice(0, 24)}`
-                    const argsJson = JSON.stringify(part.functionCall.args ?? {})
-                    totalOutputTokens += Math.ceil(argsJson.length / 3) + 10
-
-                    sendSse('content_block_start', {
-                      type: 'content_block_start',
-                      index: currentBlockIndex,
-                      content_block: {
-                        type: 'tool_use',
-                        id: toolUseId,
-                        name: part.functionCall.name,
-                        input: {},
-                      },
-                    })
-
-                    sendSse('content_block_delta', {
-                      type: 'content_block_delta',
-                      index: currentBlockIndex,
-                      delta: {
-                        type: 'input_json_delta',
-                        partial_json: argsJson,
-                      },
-                    })
-
-                    sendSse('content_block_stop', {
-                      type: 'content_block_stop',
-                      index: currentBlockIndex,
-                    })
-                  }
-                }
-              }
-            } catch {}
-          }
-        }
-      }
-
-      // 如果有尚未关闭的内容块，在此闭合
-      closeActiveBlock()
-
-      // 4. message_delta & message_stop
-      sendSse('message_delta', {
-        type: 'message_delta',
-        delta: { stop_reason: stopReason, stop_sequence: null },
-        usage: {
-          ...(totalInputTokens > 0 ? { input_tokens: totalInputTokens } : {}),
-          output_tokens: totalOutputTokens,
-        },
-      })
-
-      sendSse('message_stop', { type: 'message_stop' })
-      res.end()
-    } else {
-      // 非流式
-      const data = (await upstreamRes.json()) as any
-      const resp = data.response ?? data
-      const candidate = resp.candidates?.[0]
-      const parts = candidate?.content?.parts ?? []
-
-      const content: Array<Record<string, unknown>> = []
-      let stopReason: 'end_turn' | 'tool_use' | 'max_tokens' =
-        candidate?.finishReason === 'MAX_TOKENS' ? 'max_tokens' : 'end_turn'
-
-      for (const part of parts) {
-        if (typeof part.text === 'string' && part.text) {
-          if (part.thought === true) {
-            content.push({
-              type: 'thinking',
-              thinking: part.text,
-              ...(part.thoughtSignature ? { signature: part.thoughtSignature } : {}),
+        const closeActiveBlock = () => {
+          if (activeBlock !== 'none') {
+            sendSse('content_block_stop', {
+              type: 'content_block_stop',
+              index: currentBlockIndex,
             })
-          } else {
-            content.push({ type: 'text', text: part.text })
+            activeBlock = 'none'
           }
         }
-        if (part.functionCall && typeof part.functionCall === 'object') {
-          stopReason = 'tool_use'
-          content.push({
-            type: 'tool_use',
-            id: `toolu_${randomUUID().replace(/-/g, '').slice(0, 24)}`,
-            name: part.functionCall.name,
-            input: part.functionCall.args ?? {},
+
+        const handleParsedFrame = (parsed: any) => {
+          if (!parsed || typeof parsed !== 'object') return
+
+          if (parsed.error) {
+            const errStatus = Number(parsed.error.code) || 502
+            const errMsg = parsed.error.message || JSON.stringify(parsed.error)
+            this.ctx.log(`反重力流内返回错误帧 (${errStatus}) [model: ${upstreamModel}]: ${errMsg}`)
+            if (!streamStarted) {
+              firstStreamError = { status: errStatus, message: errMsg }
+            } else {
+              closeActiveBlock()
+              sendSse('error', {
+                type: 'error',
+                error: { type: errorTypeForStatus(errStatus), message: errMsg },
+              })
+            }
+            return
+          }
+
+          const resp = parsed.response ?? parsed
+          if (!resp || typeof resp !== 'object') return
+
+          if (resp.promptFeedback?.blockReason) {
+            lastBlockReason = String(resp.promptFeedback.blockReason)
+          }
+
+          const candidate = resp.candidates?.[0]
+          const parts = candidate?.content?.parts
+
+          if (candidate || resp.usageMetadata || resp.promptFeedback) {
+            hasValidFrame = true
+          }
+
+          if (resp.usageMetadata) {
+            if (typeof resp.usageMetadata.promptTokenCount === 'number') {
+              totalInputTokens = resp.usageMetadata.promptTokenCount
+            }
+            const candTok = resp.usageMetadata.candidatesTokenCount ?? 0
+            const thoughtTok = resp.usageMetadata.thoughtsTokenCount ?? 0
+            if (candTok + thoughtTok > 0) {
+              upstreamOutputTokens = candTok + thoughtTok
+            }
+          }
+
+          if (candidate?.finishReason) {
+            lastFinishReason = String(candidate.finishReason)
+            if (candidate.finishReason === 'MAX_TOKENS' && stopReason !== 'tool_use') {
+              stopReason = 'max_tokens'
+            }
+          }
+
+          if (!Array.isArray(parts) || parts.length === 0) return
+
+          ensureStreamStarted()
+
+          for (const part of parts) {
+            if (!part || typeof part !== 'object') continue
+
+            // 1. Thinking / Text 内容块（注意：不把 Google thoughtSignature 伪装成 Anthropic signature_delta 发射给客户端，避免解码失败）
+            if (typeof part.text === 'string' && part.text.length > 0) {
+              if (part.thought === true) {
+                if (activeBlock !== 'thinking') {
+                  closeActiveBlock()
+                  currentBlockIndex++
+                  sendSse('content_block_start', {
+                    type: 'content_block_start',
+                    index: currentBlockIndex,
+                    content_block: { type: 'thinking', thinking: '' },
+                  })
+                  activeBlock = 'thinking'
+                }
+                estimatedOutputTokens += Math.max(1, Math.ceil(part.text.length / 3))
+                sendSse('content_block_delta', {
+                  type: 'content_block_delta',
+                  index: currentBlockIndex,
+                  delta: { type: 'thinking_delta', thinking: part.text },
+                })
+                emittedVisibleOrTool = true
+              } else {
+                if (activeBlock !== 'text') {
+                  closeActiveBlock()
+                  currentBlockIndex++
+                  sendSse('content_block_start', {
+                    type: 'content_block_start',
+                    index: currentBlockIndex,
+                    content_block: { type: 'text', text: '' },
+                  })
+                  activeBlock = 'text'
+                }
+                estimatedOutputTokens += Math.max(1, Math.ceil(part.text.length / 3))
+                sendSse('content_block_delta', {
+                  type: 'content_block_delta',
+                  index: currentBlockIndex,
+                  delta: { type: 'text_delta', text: part.text },
+                })
+                emittedVisibleOrTool = true
+              }
+            }
+
+            // 2. 函数调用块 (Tool Use)，并缓存 Google thoughtSignature 供多轮回放
+            if (part.functionCall && typeof part.functionCall === 'object') {
+              closeActiveBlock()
+              stopReason = 'tool_use'
+              currentBlockIndex++
+              const toolUseId = `toolu_${randomUUID().replace(/-/g, '').slice(0, 24)}`
+              if (typeof part.thoughtSignature === 'string' && part.thoughtSignature) {
+                this.cacheThoughtSignature(toolUseId, part.thoughtSignature)
+              }
+              const argsJson = JSON.stringify(part.functionCall.args ?? {})
+              estimatedOutputTokens += Math.max(1, Math.ceil(argsJson.length / 3)) + 10
+
+              sendSse('content_block_start', {
+                type: 'content_block_start',
+                index: currentBlockIndex,
+                content_block: {
+                  type: 'tool_use',
+                  id: toolUseId,
+                  name: part.functionCall.name,
+                  input: {},
+                },
+              })
+
+              sendSse('content_block_delta', {
+                type: 'content_block_delta',
+                index: currentBlockIndex,
+                delta: {
+                  type: 'input_json_delta',
+                  partial_json: argsJson,
+                },
+              })
+
+              sendSse('content_block_stop', {
+                type: 'content_block_stop',
+                index: currentBlockIndex,
+              })
+              emittedVisibleOrTool = true
+            }
+          }
+        }
+
+        const reader = upstreamRes.body?.getReader()
+        const decoder = new TextDecoder('utf8')
+        let sseBuffer = ''
+        let rawJsonFallback = ''
+
+        const processLine = (rawLine: string) => {
+          const line = rawLine.trim()
+          if (!line || line.startsWith(':')) return
+
+          if (line.startsWith('data:')) {
+            const dataPayload = line.slice(5).trim()
+            if (!dataPayload || dataPayload === '[DONE]') return
+            try {
+              handleParsedFrame(JSON.parse(dataPayload))
+            } catch (err: any) {
+              this.ctx.log(`反重力 SSE JSON 解析异常: ${err.message}`)
+            }
+            return
+          }
+
+          // 兼容非 SSE JSON 数组流兜底
+          if (line.startsWith('{') || rawJsonFallback.length > 0) {
+            rawJsonFallback += line
+            try {
+              const cleaned = rawJsonFallback.replace(/,\s*$/, '')
+              const parsed = JSON.parse(cleaned)
+              rawJsonFallback = ''
+              handleParsedFrame(parsed)
+            } catch {
+              // 尚未形成完整 JSON 对象，等待后续行
+            }
+          }
+        }
+
+        if (reader) {
+          while (true) {
+            const { done, value } = await reader.read()
+            if (done) {
+              sseBuffer += decoder.decode()
+              break
+            }
+            sseBuffer += decoder.decode(value, { stream: true })
+            const lines = sseBuffer.split(/\r?\n/)
+            sseBuffer = lines.pop() ?? ''
+            for (const line of lines) {
+              processLine(line)
+            }
+          }
+          if (sseBuffer.trim()) {
+            processLine(sseBuffer)
+          }
+        }
+
+        if (!streamStarted && firstStreamError) {
+          return {
+            committed: false,
+            status: firstStreamError.status,
+            retryable: isRetryableHttpStatus(firstStreamError.status),
+            errorType: errorTypeForStatus(firstStreamError.status),
+            message: `反重力流式响应错误 (${firstStreamError.status}): ${firstStreamError.message}`,
+          }
+        }
+
+        if (!streamStarted && !hasValidFrame) {
+          this.ctx.log(`反重力返回空流式响应 [model: ${upstreamModel}]，交由路由器尝试切换节点`)
+          return {
+            committed: false,
+            status: 502,
+            retryable: true,
+            errorType: 'api_error',
+            message: '反重力上游返回空响应流（未包含有效候选内容）',
+          }
+        }
+
+        ensureStreamStarted()
+
+        if (!emittedVisibleOrTool && (lastBlockReason || (lastFinishReason && lastFinishReason !== 'STOP'))) {
+          const reasonDetail = lastBlockReason || lastFinishReason
+          this.ctx.log(
+            `反重力空内容结束 [model: ${upstreamModel}, reason: ${reasonDetail}]，已补充可读说明防止客户端空解码`
+          )
+          currentBlockIndex++
+          sendSse('content_block_start', {
+            type: 'content_block_start',
+            index: currentBlockIndex,
+            content_block: { type: 'text', text: '' },
+          })
+          activeBlock = 'text'
+          sendSse('content_block_delta', {
+            type: 'content_block_delta',
+            index: currentBlockIndex,
+            delta: { type: 'text_delta', text: `[上游未返回可显示内容，结束原因: ${reasonDetail}]` },
           })
         }
-      }
 
-      const usageMeta = resp.usageMetadata ?? {}
-      const inputTokens = typeof usageMeta.promptTokenCount === 'number' ? usageMeta.promptTokenCount : 0
-      const outputTokens =
-        (usageMeta.candidatesTokenCount ?? 0) + (usageMeta.thoughtsTokenCount ?? 0) || 50
+        closeActiveBlock()
 
-      res.statusCode = 200
-      res.setHeader('Content-Type', 'application/json')
-      res.end(
-        JSON.stringify({
-          id: messageId,
-          type: 'message',
-          role: 'assistant',
-          content,
-          model: request.model,
-          stop_reason: stopReason,
-          stop_sequence: null,
+        const finalOutputTokens =
+          upstreamOutputTokens > 0 ? upstreamOutputTokens : estimatedOutputTokens
+
+        sendSse('message_delta', {
+          type: 'message_delta',
+          delta: { stop_reason: stopReason, stop_sequence: null },
           usage: {
-            input_tokens: inputTokens,
-            output_tokens: outputTokens,
+            ...(totalInputTokens > 0 ? { input_tokens: totalInputTokens } : {}),
+            output_tokens: finalOutputTokens,
           },
         })
-      )
-    }
+
+        sendSse('message_stop', { type: 'message_stop' })
+        res.end()
+        return { committed: true }
+      } else {
+        // 非流式
+        const data = (await upstreamRes.json()) as any
+        if (data?.error) {
+          const errStatus = Number(data.error.code) || 502
+          return {
+            committed: false,
+            status: errStatus,
+            retryable: isRetryableHttpStatus(errStatus),
+            errorType: errorTypeForStatus(errStatus),
+            message: `反重力响应错误 (${errStatus}): ${data.error.message || JSON.stringify(data.error)}`,
+          }
+        }
+
+        const resp = data.response ?? data
+        const candidate = resp.candidates?.[0]
+        const parts = candidate?.content?.parts ?? []
+
+        const content: Array<Record<string, unknown>> = []
+        let stopReason: 'end_turn' | 'tool_use' | 'max_tokens' =
+          candidate?.finishReason === 'MAX_TOKENS' ? 'max_tokens' : 'end_turn'
+
+        for (const part of parts) {
+          if (typeof part.text === 'string' && part.text) {
+            if (part.thought === true) {
+              content.push({
+                type: 'thinking',
+                thinking: part.text,
+              })
+            } else {
+              content.push({ type: 'text', text: part.text })
+            }
+          }
+          if (part.functionCall && typeof part.functionCall === 'object') {
+            stopReason = 'tool_use'
+            const toolUseId = `toolu_${randomUUID().replace(/-/g, '').slice(0, 24)}`
+            if (typeof part.thoughtSignature === 'string' && part.thoughtSignature) {
+              this.cacheThoughtSignature(toolUseId, part.thoughtSignature)
+            }
+            content.push({
+              type: 'tool_use',
+              id: toolUseId,
+              name: part.functionCall.name,
+              input: part.functionCall.args ?? {},
+            })
+          }
+        }
+
+        if (content.length === 0) {
+          const reason = resp.promptFeedback?.blockReason || candidate?.finishReason || 'EMPTY_RESPONSE'
+          if (!candidate) {
+            return {
+              committed: false,
+              status: 502,
+              retryable: true,
+              errorType: 'api_error',
+              message: `反重力非流式响应为空 (${reason})`,
+            }
+          }
+          content.push({ type: 'text', text: `[上游未返回内容，结束原因: ${reason}]` })
+        }
+
+        const usageMeta = resp.usageMetadata ?? {}
+        const inputTokens = typeof usageMeta.promptTokenCount === 'number' ? usageMeta.promptTokenCount : 0
+        const outputTokens =
+          (usageMeta.candidatesTokenCount ?? 0) + (usageMeta.thoughtsTokenCount ?? 0) || 50
+
+        res.statusCode = 200
+        res.setHeader('Content-Type', 'application/json')
+        res.end(
+          JSON.stringify({
+            id: messageId,
+            type: 'message',
+            role: 'assistant',
+            content,
+            model: request.model,
+            stop_reason: stopReason,
+            stop_sequence: null,
+            usage: {
+              input_tokens: inputTokens,
+              output_tokens: outputTokens,
+            },
+          })
+        )
+        return { committed: true }
+      }
     } catch (err: any) {
-      if (abortCtrl.signal.aborted) return
+      if (abortCtrl.signal.aborted) return { committed: true }
+      if (!res.headersSent) {
+        return {
+          committed: false,
+          status: 502,
+          retryable: true,
+          errorType: 'api_error',
+          message: err?.message ?? String(err),
+        }
+      }
       throw err
     } finally {
       res.off('close', onResClose)

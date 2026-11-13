@@ -6,6 +6,7 @@ import { timingSafeEqual } from 'node:crypto'
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import type { AnthropicRequest, GatewayConfig, RequestContext, RouteConfig } from './types.ts'
 import type { ModuleHost } from './module-host.ts'
+import { GatewayRouter } from './router.ts'
 import { errorPayload } from './protocol/anthropic.ts'
 
 export interface ServerOptions {
@@ -35,6 +36,7 @@ export function createGatewayServer(options: ServerOptions): {
   server: Server
 } {
   const { config, host, log } = options
+  const router = new GatewayRouter()
 
   const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
     // 1. 安全检查：只允许 127.0.0.1 / localhost 访问
@@ -83,6 +85,7 @@ export function createGatewayServer(options: ServerOptions): {
           port: config.port,
           modules: statuses,
           routes: config.routes,
+          breakers: router.getBreakerStats(),
         }, null, 2)
       )
       return
@@ -210,9 +213,6 @@ export function createGatewayServer(options: ServerOptions): {
         return
       }
 
-      const reqModel = parsed.model ?? ''
-      const route: RouteConfig | undefined = config.routes[reqModel]
-
       const reqContext: RequestContext = {
         req,
         headers: req.headers,
@@ -220,63 +220,7 @@ export function createGatewayServer(options: ServerOptions): {
         log,
       }
 
-      if (route) {
-        const mod = host.getModule(route.module)
-        if (mod) {
-          log(`分流路由: 模型 "${reqModel}" -> 模块 [${mod.name}] (目标: ${route.targetModel ?? '默认'})`)
-          try {
-            await mod.handleRequest(parsed, res, reqContext, route.targetModel)
-            return
-          } catch (err: any) {
-            log(`模块 [${mod.name}] 处理异常: ${err.message}`)
-            if (!res.headersSent) {
-              res.statusCode = 500
-              res.setHeader('Content-Type', 'application/json')
-              res.end(errorPayload('api_error', err.message))
-            }
-            return
-          }
-        }
-      }
-
-      // 未命中已知路由：智能回退（绝不把陌生的 claude-* 直接透传给不支持它的下游）
-      if (reqModel.includes('antigravity') || reqModel.includes('gemini')) {
-        const agy = host.getAntigravityModule()
-        log(`未配置路由，回退到反重力模块: "${reqModel}"`)
-        await agy.handleRequest(parsed, res, reqContext)
-        return
-      }
-
-      if (reqModel.includes('deepseek')) {
-        const pass = host.getPassthroughModule()
-        log(`未配置路由，回退到直连透传: "${reqModel}"`)
-        await pass.handleRequest(parsed, res, reqContext)
-        return
-      }
-
-      // 若是后台发出的未登记 claude-* 请求（例如标题生成/摘要模型），智能映射到已登记的轻量或首条可用路由
-      const isLocalGatewayToken = clientKey === config.token
-      const routeValues = Object.values(config.routes).filter(
-        (r) => !(isLocalGatewayToken && r.module === 'passthrough')
-      )
-      const fallbackRoute =
-        (reqModel.includes('haiku')
-          ? routeValues.find((r) => r.targetModel?.includes('flash') || r.label?.includes('Flash'))
-          : undefined) ?? routeValues[0]
-
-      if (fallbackRoute) {
-        const mod = host.getModule(fallbackRoute.module)
-        if (mod) {
-          log(`未命中路由 "${reqModel}"，智能降级至 [${mod.name}] -> ${fallbackRoute.targetModel}`)
-          await mod.handleRequest(parsed, res, reqContext, fallbackRoute.targetModel)
-          return
-        }
-      }
-
-      // 终极兜底
-      const agy = host.getAntigravityModule()
-      log(`无可用路由，终极兜底至反重力: "${reqModel}"`)
-      await agy.handleRequest(parsed, res, reqContext)
+      await router.dispatchMessage(parsed, res, reqContext, config, host, log)
       return
     }
 

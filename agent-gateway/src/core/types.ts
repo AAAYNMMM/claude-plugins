@@ -108,7 +108,26 @@ export interface GatewayConfig {
     deepseekBaseUrl?: string
     settingsBaseUrl?: string
   }
+  failover?: {
+    enabled?: boolean
+    maxAttempts?: number
+    failureThreshold?: number
+    successThreshold?: number
+    cooldownSeconds?: number
+    crossModuleFailover?: boolean
+  }
 }
+
+export type RouteAttemptResult =
+  | { committed: true }
+  | {
+      committed: false
+      status: number
+      retryable: boolean
+      retryAfterMs?: number
+      errorType?: string
+      message: string
+    }
 
 export interface GatewayModule {
   readonly id: string
@@ -123,6 +142,12 @@ export interface GatewayModule {
     context: RequestContext,
     targetModel?: string
   ): Promise<void>
+  tryHandleRequest?(
+    request: AnthropicRequest,
+    res: ServerResponse,
+    context: RequestContext,
+    targetModel?: string
+  ): Promise<RouteAttemptResult>
   getStatus?(): Promise<ModuleStatus>
   dispose?(): Promise<void>
 }

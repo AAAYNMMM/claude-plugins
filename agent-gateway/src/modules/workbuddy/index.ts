@@ -12,8 +12,10 @@ import type {
   ModuleModelInfo,
   ModuleStatus,
   RequestContext,
+  RouteAttemptResult,
   AnthropicRequest,
 } from '../../core/types.ts'
+import { isRetryableHttpStatus } from '../../core/router.ts'
 import {
   collectAnthropic,
   errorPayload,
@@ -275,11 +277,34 @@ export class WorkBuddyModule implements GatewayModule {
   async handleRequest(
     request: AnthropicRequest,
     res: ServerResponse,
-    _context: RequestContext,
+    context: RequestContext,
     targetModel?: string
   ): Promise<void> {
+    const result = await this.tryHandleRequest(request, res, context, targetModel)
+    if (!result.committed && !res.headersSent) {
+      res.statusCode = result.status
+      res.setHeader('Content-Type', 'application/json')
+      if (result.status === 429 && result.retryAfterMs) {
+        res.setHeader('Retry-After', String(Math.max(1, Math.ceil(result.retryAfterMs / 1000))))
+      }
+      res.end(errorPayload(result.errorType ?? errorTypeForStatus(result.status), result.message))
+    }
+  }
+
+  async tryHandleRequest(
+    request: AnthropicRequest,
+    res: ServerResponse,
+    _context: RequestContext,
+    targetModel?: string
+  ): Promise<RouteAttemptResult> {
     if (!this.shimInstance) {
-      throw new Error('WorkBuddy shim 未初始化')
+      return {
+        committed: false,
+        status: 503,
+        retryable: true,
+        errorType: 'api_error',
+        message: 'WorkBuddy shim 未初始化',
+      }
     }
 
     const actualModel = targetModel || request.model
@@ -300,18 +325,30 @@ export class WorkBuddyModule implements GatewayModule {
         body: JSON.stringify(openAiBody),
       })
     } catch (err: any) {
-      res.statusCode = 502
-      res.setHeader('Content-Type', 'application/json')
-      res.end(errorPayload('api_error', `无法连接 WorkBuddy shim: ${err.message}`))
-      return
+      return {
+        committed: false,
+        status: 502,
+        retryable: true,
+        errorType: 'api_error',
+        message: `无法连接 WorkBuddy shim: ${err.message}`,
+      }
     }
 
     if (!upstreamRes.ok) {
       const text = await upstreamRes.text()
-      res.statusCode = upstreamRes.status
-      res.setHeader('Content-Type', 'application/json')
-      res.end(errorPayload(errorTypeForStatus(upstreamRes.status), `WorkBuddy 上游错误 (${upstreamRes.status}): ${text}`))
-      return
+      const status = upstreamRes.status
+      const retryAfterHeader = upstreamRes.headers.get('retry-after')
+      const retrySec = retryAfterHeader ? Number(retryAfterHeader) : NaN
+      const retryAfterMs =
+        Number.isFinite(retrySec) && retrySec > 0 ? Math.ceil(retrySec * 1000) : undefined
+      return {
+        committed: false,
+        status,
+        retryable: isRetryableHttpStatus(status),
+        retryAfterMs,
+        errorType: errorTypeForStatus(status),
+        message: `WorkBuddy 上游错误 (${status}): ${text}`,
+      }
     }
 
     if (request.stream) {
@@ -325,12 +362,14 @@ export class WorkBuddyModule implements GatewayModule {
         model: request.model,
         clientSawStreaming: true,
       })
+      return { committed: true }
     } else {
       const data = await upstreamRes.json()
       const anthropicResponse = collectAnthropic(data, request.model)
       res.statusCode = 200
       res.setHeader('Content-Type', 'application/json')
       res.end(JSON.stringify(anthropicResponse))
+      return { committed: true }
     }
   }
 

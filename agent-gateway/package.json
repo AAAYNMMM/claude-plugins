@@ -9,6 +9,7 @@
   },
   "scripts": {
     "build": "node build.mjs",
+    "test": "node --experimental-transform-types --test tests/*.test.ts",
     "start": "node dist/server.js serve",
     "status": "node dist/server.js status",
     "models": "node dist/server.js models",

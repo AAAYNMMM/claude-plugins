@@ -30,6 +30,10 @@ interface RawAvailableModel {
   supportsThinking?: boolean
   maxTokens?: number
   maxOutputTokens?: number
+  quotaInfo?: {
+    remainingFraction?: number
+    resetTime?: string
+  }
 }
 
 interface RawAvailableModelsResponse {
@@ -78,6 +82,7 @@ let cachedAt = 0
 let cachedProjectId: string | null = null
 const dynamicUpstreamMap = new Map<string, string>()
 const dynamicMaxOutputMap = new Map<string, number>()
+const dynamicQuotaMap = new Map<string, number>()
 
 /**
  * 读取本地 Antigravity IDE 版本（优先 daemon hub 文件，其次安装包 package.json）。
@@ -202,6 +207,11 @@ function parseAvailableModelsResponse(data: RawAvailableModelsResponse): Antigra
     dynamicUpstreamMap.set(id.toLowerCase(), id)
     if (typeof info.maxOutputTokens === 'number' && info.maxOutputTokens > 0) {
       dynamicMaxOutputMap.set(id, info.maxOutputTokens)
+    }
+    const frac = info.quotaInfo?.remainingFraction
+    if (typeof frac === 'number' && Number.isFinite(frac)) {
+      dynamicQuotaMap.set(id, frac)
+      dynamicQuotaMap.set(id.toLowerCase(), frac)
     }
   }
 
@@ -423,4 +433,22 @@ export function resolveUpstreamModel(modelId: string): string {
  */
 export function getModelMaxOutputTokens(upstreamModelId: string): number | undefined {
   return dynamicMaxOutputMap.get(upstreamModelId)
+}
+
+/**
+ * 将 Antigravity 上游模型归类到其独立的配额桶，参考实测 fetchAvailableModels 的 resetTime/remainingFraction：
+ * - argon: gemini-4-argon 系列（周配额独立池）
+ * - claude: claude-* 与 gpt-oss-* 系列
+ * - gemini-5h: gemini-3.8-flash / gemini-4-hydrogen / gemini-2.5 / gemini-3 等共享 5 小时池
+ */
+export function getQuotaBucket(upstreamModelId: string): string {
+  const lower = upstreamModelId.toLowerCase()
+  if (lower.includes('argon')) return 'argon'
+  if (lower.includes('claude') || lower.includes('gpt-oss')) return 'claude'
+  if (lower.includes('gemini') || lower.includes('hydrogen')) return 'gemini-5h'
+  return 'default'
+}
+
+export function getModelRemainingFraction(upstreamModelId: string): number | undefined {
+  return dynamicQuotaMap.get(upstreamModelId) ?? dynamicQuotaMap.get(upstreamModelId.toLowerCase())
 }

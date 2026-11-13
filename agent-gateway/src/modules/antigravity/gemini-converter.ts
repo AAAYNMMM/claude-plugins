@@ -145,8 +145,16 @@ export function cleanSchemaForGemini(schema: any): Record<string, unknown> {
   return cleaned
 }
 
+export interface GeminiConvertOptions {
+  thoughtSignatureByToolId?: Map<string, string>
+  fallbackThoughtSignature?: string
+}
+
 /** 把 Anthropic 的消息流转换为 Gemini 格式 */
-export function toGeminiRequest(req: AnthropicRequest): GeminiRequest {
+export function toGeminiRequest(
+  req: AnthropicRequest,
+  options: GeminiConvertOptions = {}
+): GeminiRequest {
   const contents: GeminiContent[] = []
   // 维护 tool_use_id -> tool_name 映射，供下一轮 tool_result 查找真实函数名
   const toolIdToName = new Map<string, string>()
@@ -195,12 +203,19 @@ export function toGeminiRequest(req: AnthropicRequest): GeminiRequest {
             })
           }
         } else if (part.type === 'tool_use') {
-          parts.push({
+          const toolId = typeof (part as any).id === 'string' ? (part as any).id : ''
+          const cachedSig = toolId ? options.thoughtSignatureByToolId?.get(toolId) : undefined
+          const sig = cachedSig || (part as any).signature || options.fallbackThoughtSignature
+          const fcPart: GeminiPart = {
             functionCall: {
               name: (part as any).name,
               args: (part as any).input ?? {},
             },
-          })
+          }
+          if (typeof sig === 'string' && sig) {
+            fcPart.thoughtSignature = sig
+          }
+          parts.push(fcPart)
         } else if (part.type === 'tool_result') {
           const toolUseId = (part as any).tool_use_id
           const functionName = toolIdToName.get(toolUseId) || 'tool_result'

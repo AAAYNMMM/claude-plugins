@@ -9,9 +9,11 @@ import type {
   ModuleModelInfo,
   ModuleStatus,
   RequestContext,
+  RouteAttemptResult,
   AnthropicRequest,
 } from '../../core/types.ts'
-import { errorPayload } from '../../core/protocol/anthropic.ts'
+import { errorPayload, errorTypeForStatus } from '../../core/protocol/anthropic.ts'
+import { isRetryableHttpStatus } from '../../core/router.ts'
 
 export class PassthroughModule implements GatewayModule {
   readonly id = 'passthrough'
@@ -47,6 +49,20 @@ export class PassthroughModule implements GatewayModule {
     context: RequestContext,
     targetModel?: string
   ): Promise<void> {
+    const result = await this.tryHandleRequest(request, res, context, targetModel)
+    if (!result.committed && !res.headersSent) {
+      res.statusCode = result.status
+      res.setHeader('Content-Type', 'application/json')
+      res.end(errorPayload(result.errorType ?? errorTypeForStatus(result.status), result.message))
+    }
+  }
+
+  async tryHandleRequest(
+    request: AnthropicRequest,
+    res: ServerResponse,
+    context: RequestContext,
+    targetModel?: string
+  ): Promise<RouteAttemptResult> {
     const upstreamUrl = `${this.targetUrl.replace(/\/+$/, '')}/v1/messages`
     const clientKey = context.clientKey
     const outboundRequest =
@@ -71,10 +87,25 @@ export class PassthroughModule implements GatewayModule {
         body: JSON.stringify(outboundRequest),
       })
     } catch (err: any) {
-      res.statusCode = 502
-      res.setHeader('Content-Type', 'application/json')
-      res.end(errorPayload('api_error', `无法连接透传上游: ${err.message}`))
-      return
+      return {
+        committed: false,
+        status: 502,
+        retryable: true,
+        errorType: 'api_error',
+        message: `无法连接透传上游: ${err.message}`,
+      }
+    }
+
+    if (!upstreamRes.ok) {
+      const errText = await upstreamRes.text()
+      const status = upstreamRes.status
+      return {
+        committed: false,
+        status,
+        retryable: isRetryableHttpStatus(status),
+        errorType: errorTypeForStatus(status),
+        message: `透传上游错误 (${status}): ${errText}`,
+      }
     }
 
     res.statusCode = upstreamRes.status
@@ -93,6 +124,7 @@ export class PassthroughModule implements GatewayModule {
       }
     }
     res.end()
+    return { committed: true }
   }
 
   async getStatus(): Promise<ModuleStatus> {
