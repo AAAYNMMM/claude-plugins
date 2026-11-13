@@ -209,31 +209,59 @@ async function doSyncGatewayRoutes(
     return 0
   })
 
-  // 最佳合规别名首选映射：使 Claude 桌面端自动挂载原生 Thinking Effort 滑块与多模态能力
-  const PREFERRED_ALIASES: Record<string, string> = {
-    'gemini-3.8-flash-high': 'claude-fable-5-2',
-    'claude-sonnet-4-6': 'claude-sonnet-5-5',
-    'claude-opus-4-6': 'claude-opus-5-5',
-    'gpt-oss-120b': 'claude-haiku-5-5',
+  // 动态合规别名两阶段分配：
+  // 1) 按模型语义与能力特征（opus / sonnet / flash / flagship）优先匹配 Claude 原生 Thinking 别名，
+  //    避免后续模型抢占 Opus/Sonnet/Flash 专属槽位；
+  // 2) 为其余动态新增模型顺位分配未使用的合规别名，并严格保持上游展示顺序。
+  const getPreferredCandidates = (modId: string, model: { id: string; name: string; recommendedAlias?: string }): string[] => {
+    const candidates: string[] = []
+    if (model.recommendedAlias && COMPLIANT_ALIASES.includes(model.recommendedAlias)) {
+      candidates.push(model.recommendedAlias)
+    }
+    const lower = `${model.id} ${model.name}`.toLowerCase()
+    if (lower.includes('opus')) {
+      candidates.push('claude-opus-5-5', 'claude-opus-5', 'claude-opus-4-8', 'claude-opus-4-7', 'claude-opus-4-6')
+    } else if (lower.includes('sonnet')) {
+      candidates.push('claude-sonnet-5-5', 'claude-sonnet-5', 'claude-sonnet-4-6')
+    } else if (lower.includes('flash') || lower.includes('lite') || lower.includes('haiku')) {
+      candidates.push('claude-haiku-5-5', 'claude-haiku-4-5-20251001', 'claude-3-5-haiku-20241022')
+    } else if (
+      modId === 'antigravity' &&
+      (lower.includes('argon') || lower.includes('hydrogen') || lower.includes('carbon') || lower.includes('pro'))
+    ) {
+      candidates.push('claude-fable-5-2', 'claude-fable-5-1', 'claude-fable-5', 'claude-opus-4-8', 'claude-opus-4-7')
+    }
+    return candidates
+  }
+
+  const eligibleItems = aggregated.filter((item) => item.module !== 'passthrough')
+  const assignedAliases = new Array<string | undefined>(eligibleItems.length)
+
+  for (let i = 0; i < eligibleItems.length; i++) {
+    const { module: modId, model } = eligibleItems[i]
+    for (const candidate of getPreferredCandidates(modId, model)) {
+      if (COMPLIANT_ALIASES.includes(candidate) && !usedAliases.has(candidate)) {
+        assignedAliases[i] = candidate
+        usedAliases.add(candidate)
+        break
+      }
+    }
   }
 
   let aliasIdx = 0
-  for (const item of aggregated) {
-    const { module: modId, model } = item
-    if (modId === 'passthrough') continue
-
-    // 优先采用针对性合规别名，次选池中顺位别名
-    let alias = PREFERRED_ALIASES[model.id]
-    if (!alias || usedAliases.has(alias) || !COMPLIANT_ALIASES.includes(alias)) {
+  for (let i = 0; i < eligibleItems.length; i++) {
+    if (!assignedAliases[i]) {
       while (aliasIdx < COMPLIANT_ALIASES.length && usedAliases.has(COMPLIANT_ALIASES[aliasIdx])) {
         aliasIdx++
       }
-      if (aliasIdx >= COMPLIANT_ALIASES.length) break
-      alias = COMPLIANT_ALIASES[aliasIdx++]
+      if (aliasIdx >= COMPLIANT_ALIASES.length) continue
+      const alias = COMPLIANT_ALIASES[aliasIdx++]
+      assignedAliases[i] = alias
+      usedAliases.add(alias)
     }
 
-    usedAliases.add(alias)
-    newRoutes[alias] = {
+    const { module: modId, model } = eligibleItems[i]
+    newRoutes[assignedAliases[i]!] = {
       module: modId,
       targetModel: model.id,
       label: model.labelOverride ?? model.name,

@@ -18,18 +18,21 @@ import type {
   RequestContext,
   AnthropicRequest,
 } from '../../core/types.ts'
-import { ANTIGRAVITY_MODELS, resolveUpstreamModel } from './models.ts'
+import {
+  ANTIGRAVITY_API_HOST,
+  fetchLiveProjectAndTier,
+  getAntigravityUserAgent,
+  getDynamicAntigravityModels,
+  resolveUpstreamModel,
+} from './models.ts'
 import { toGeminiRequest } from './gemini-converter.ts'
 import { errorPayload } from '../../core/protocol/anthropic.ts'
 import { antigravityAuth } from './auth.ts'
 
-const ANTIGRAVITY_API_HOST = 'https://daily-cloudcode-pa.googleapis.com'
-const PROJECT_ID = 'aicode-consumers'
-
 export class AntigravityModule implements GatewayModule {
   readonly id = 'antigravity'
   readonly name = '反重力 (Antigravity)'
-  readonly description = '反重力桌面端免密桥接 (Gemini 3.8 / Claude 4.6 / GPT-OSS 120B)'
+  readonly description = '反重力桌面端免密桥接 (动态模型同步)'
 
   private ctx!: ModuleContext
   private accountEmail: string = ''
@@ -45,7 +48,11 @@ export class AntigravityModule implements GatewayModule {
   }
 
   async listModels(): Promise<ModuleModelInfo[]> {
-    return ANTIGRAVITY_MODELS
+    let token: string | null = null
+    try {
+      token = await antigravityAuth.getAccessToken()
+    } catch {}
+    return getDynamicAntigravityModels(token, { forceRefresh: true })
   }
 
   async handleRequest(
@@ -54,9 +61,6 @@ export class AntigravityModule implements GatewayModule {
     _context: RequestContext,
     targetModel?: string
   ): Promise<void> {
-    const rawModel = targetModel || request.model || 'gemini-3.8-flash'
-    const upstreamModel = resolveUpstreamModel(rawModel)
-
     let accessToken: string
     try {
       accessToken = await antigravityAuth.getAccessToken()
@@ -74,10 +78,18 @@ export class AntigravityModule implements GatewayModule {
       return
     }
 
+    // 确保动态模型映射表与项目 ID 已预热（命中缓存时零额外延迟）
+    await getDynamicAntigravityModels(accessToken)
+    const rawModel = targetModel || request.model || resolveUpstreamModel('')
+    const upstreamModel = resolveUpstreamModel(rawModel)
+    const { projectId } = await fetchLiveProjectAndTier(accessToken)
+
     const geminiBody = toGeminiRequest(request)
     const payload = {
-      project: PROJECT_ID,
+      project: projectId,
       model: upstreamModel,
+      userAgent: 'antigravity',
+      requestType: 'agent',
       request: geminiBody,
     }
 
@@ -93,7 +105,7 @@ export class AntigravityModule implements GatewayModule {
         headers: {
           'Authorization': `Bearer ${accessToken}`,
           'Content-Type': 'application/json',
-          'User-Agent': 'antigravity/2.31.0',
+          'User-Agent': getAntigravityUserAgent(),
         },
         body: JSON.stringify(payload),
       })
