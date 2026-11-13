@@ -10,10 +10,10 @@ import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
   DATA_DIR,
-  ORIGINAL_PROVIDER_BACKUP,
   STATUS_FILE,
   applyGatewayToClaude,
   applyGatewayToSettings,
+  extractUserProviderConfig,
   loadGatewayConfig,
   logMessage,
   restoreOriginalClaudeProvider,
@@ -196,16 +196,49 @@ async function doSyncGatewayRoutes(
     })
   }
 
-  const aggregated = await host.aggregateModels()
-  if (!aggregated || aggregated.length === 0) {
-    return config.routes
+  // 读取用户当前配置中的自配模型与上游地址（若存在旧版隔离备份，一并无缝迁回）
+  const userProvider = extractUserProviderConfig()
+  if (userProvider.upstreamBaseUrl) {
+    config.passthrough = {
+      ...config.passthrough,
+      deepseekBaseUrl: userProvider.upstreamBaseUrl,
+    }
+    host.getPassthroughModule().setBaseUrl(userProvider.upstreamBaseUrl)
   }
 
+  const aggregated = await host.aggregateModels()
   const newRoutes: Record<string, RouteConfig> = {}
   const usedAliases = new Set<string>()
 
-  // 优先排序：反重力模型置顶，随后 WorkBuddy 主力模型
-  aggregated.sort((a, b) => {
+  // 1) 最优先保留并置顶用户原配置中的模型（如 claude-sonnet-5.5 -> deepseek-v4-flash），原样直连透传
+  for (const userModel of userProvider.userModels) {
+    if (usedAliases.has(userModel.name)) continue
+    newRoutes[userModel.name] = {
+      module: 'passthrough',
+      targetModel: userModel.name,
+      label: userModel.labelOverride ?? userModel.name,
+    }
+    usedAliases.add(userModel.name)
+  }
+
+  // 若用户原配置里尚未登记过任何透传模型，再补充内置默认透传条目兜底
+  if (userProvider.userModels.length === 0) {
+    for (const item of aggregated) {
+      if (item.module !== 'passthrough') continue
+      const alias = item.model.recommendedAlias || item.model.id
+      if (usedAliases.has(alias)) continue
+      newRoutes[alias] = {
+        module: 'passthrough',
+        targetModel: item.model.id,
+        label: item.model.labelOverride ?? item.model.name,
+      }
+      usedAliases.add(alias)
+    }
+  }
+
+  // 2) 优先排序网关扩展模型：反重力模型在前，随后 WorkBuddy 主力模型
+  const extensionItems = aggregated.filter((item) => item.module !== 'passthrough')
+  extensionItems.sort((a, b) => {
     if (a.module === 'antigravity' && b.module !== 'antigravity') return -1
     if (a.module !== 'antigravity' && b.module === 'antigravity') return 1
     return 0
@@ -236,7 +269,7 @@ async function doSyncGatewayRoutes(
     return candidates
   }
 
-  const eligibleItems = aggregated.filter((item) => item.module !== 'passthrough')
+  const eligibleItems = extensionItems
   const assignedAliases = new Array<string | undefined>(eligibleItems.length)
 
   for (let i = 0; i < eligibleItems.length; i++) {
@@ -274,11 +307,19 @@ async function doSyncGatewayRoutes(
     config.routes = newRoutes
     saveGatewayConfig(config)
 
-    if (options.updateClaude !== false && existsSync(ORIGINAL_PROVIDER_BACKUP)) {
+    if (options.updateClaude !== false && userProvider.activePath) {
       try {
-        applyGatewayToClaude(newRoutes, config.port)
+        const applied = applyGatewayToClaude(newRoutes, config.port)
+        if (applied.previousBaseUrl) {
+          config.passthrough = {
+            ...config.passthrough,
+            deepseekBaseUrl: applied.previousBaseUrl,
+          }
+          host.getPassthroughModule().setBaseUrl(applied.previousBaseUrl)
+          saveGatewayConfig(config)
+        }
         if (!options.silent) {
-          logMessage(`✓ 已同步更新 Claude 桌面端模型列表（共 ${Object.keys(newRoutes).length} 个模型）`)
+          logMessage(`✓ 已同步更新用户配置中的模型列表（共 ${Object.keys(newRoutes).length} 个模型）`)
         }
       } catch (err: any) {
         if (!options.silent) {
@@ -335,6 +376,9 @@ async function main() {
 
   if (config.antigravity?.apiKey) {
     host.getAntigravityModule().setApiKey(config.antigravity.apiKey)
+  }
+  if (config.passthrough?.deepseekBaseUrl) {
+    host.getPassthroughModule().setBaseUrl(config.passthrough.deepseekBaseUrl)
   }
 
   // 0. 一键开启网关并接入 Claude 桌面端
@@ -394,21 +438,22 @@ async function main() {
       freshRoutes = await syncGatewayRoutes(host, currentConfig, { silent: isSilent })
     }
 
-    // 同步切换 CLI 与 Code 标签页环境至本地网关
-    const routeAliases = Object.keys(freshRoutes)
-    const primaryAlias = routeAliases[1] ?? routeAliases[0] ?? 'claude-sonnet-5-5'
-    const smallAlias =
-      routeAliases.find((a) => freshRoutes[a]?.targetModel?.includes('flash')) ??
-      routeAliases[0] ??
-      'claude-haiku-5-5'
-    applyGatewayToSettings(currentConfig.port, currentConfig.token, primaryAlias, smallAlias)
+    // 直接在用户的 ~/.claude/settings.json 中指向本地网关并清理历史强制覆盖模型，不搞独立配置
+    applyGatewayToSettings(currentConfig.port, currentConfig.token, currentConfig)
 
     try {
       const res = applyGatewayToClaude(freshRoutes, currentConfig.port)
+      if (res.previousBaseUrl) {
+        currentConfig.passthrough = {
+          ...currentConfig.passthrough,
+          deepseekBaseUrl: res.previousBaseUrl,
+        }
+        saveGatewayConfig(currentConfig)
+      }
       if (!isSilent) {
-        process.stdout.write(`\n✓ agent-gateway 网关已成功开启并接入 Claude 桌面端与 CLI！\n`)
+        process.stdout.write(`\n✓ agent-gateway 网关已成功开启并写入用户配置！\n`)
         process.stdout.write(`  网关监听: http://127.0.0.1:${currentConfig.port}\n`)
-        process.stdout.write(`  已注入模型: ${res.modelCount} 个\n`)
+        process.stdout.write(`  已写入模型: ${res.modelCount} 个（已保留用户原有自配模型）\n`)
         process.stdout.write(`  提示: 若当前 Claude 桌面端正在运行，重启桌面端即可生效最新模型。\n\n`)
       }
     } catch (err: any) {
@@ -426,19 +471,19 @@ async function main() {
     process.exit(0)
   }
 
-  // 0.1 一键关闭网关并还原原本配置
+  // 0.1 一键关闭网关并还原用户配置里的原本上游地址（保留用户自配模型）
   if (command === 'off' || command === 'disable') {
-    process.stdout.write('正在关闭 agent-gateway 网关并还原原本配置...\n')
+    process.stdout.write('正在关闭 agent-gateway 网关并还原用户配置...\n')
     // 1. 彻底停止所有后台守护与自启 VBS 循环
     stopGatewayDaemons(config.port)
 
     // 2. 联动还原 CLI / Code 标签页环境（~/.claude/settings.json）
-    const settingsRestored = restoreOriginalSettings()
+    const settingsRestored = restoreOriginalSettings(config.token, config.passthrough?.settingsBaseUrl)
 
-    // 3. 还原桌面端 Provider 配置
+    // 3. 还原桌面端用户配置
     try {
-      restoreOriginalClaudeProvider()
-      process.stdout.write(`✓ 已完整还原 Claude 桌面端原本的代理/账号配置${settingsRestored ? '（及 CLI 环境）' : ''}！\n`)
+      restoreOriginalClaudeProvider(config.passthrough?.deepseekBaseUrl)
+      process.stdout.write(`✓ 已移除网关注入条目并还原用户配置${settingsRestored ? '（含 CLI settings.json）' : ''}！\n`)
       process.stdout.write(`  提示: 若当前正在桌面端中使用网关，请开启新会话或重启 Claude 桌面端使其生效。\n\n`)
     } catch (err: any) {
       process.stdout.write(`  提示: ${err.message}\n\n`)

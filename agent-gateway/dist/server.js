@@ -9,7 +9,7 @@ import { join as join14 } from "node:path";
 import { fileURLToPath as fileURLToPath2 } from "node:url";
 
 // src/core/config.ts
-import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
@@ -87,29 +87,63 @@ function getActiveClaudeProviderPath() {
   }
   return null;
 }
-function backupOriginalClaudeProvider() {
+function isGatewayManagedModelLabel(label) {
+  return typeof label === "string" && (label.startsWith("AGY \xB7 ") || label.startsWith("WB \xB7 "));
+}
+function extractUserProviderConfig() {
   const activePath = getActiveClaudeProviderPath();
-  if (!activePath) return false;
-  mkdirSync(DATA_DIR, { recursive: true });
-  if (existsSync(ORIGINAL_PROVIDER_BACKUP)) return false;
-  try {
-    const raw = JSON.parse(readFileSync(activePath, "utf8"));
-    if (isLocalGatewayUrl(raw.inferenceGatewayBaseUrl)) {
-      return false;
+  const userModels = [];
+  const seen = /* @__PURE__ */ new Set();
+  let upstreamBaseUrl;
+  const collectFrom = (raw) => {
+    if (!raw || typeof raw !== "object") return;
+    if (!upstreamBaseUrl && typeof raw.inferenceGatewayBaseUrl === "string" && raw.inferenceGatewayBaseUrl.trim() && !isLocalGatewayUrl(raw.inferenceGatewayBaseUrl)) {
+      upstreamBaseUrl = raw.inferenceGatewayBaseUrl.trim();
     }
-  } catch {
-    return false;
+    if (Array.isArray(raw.inferenceModels)) {
+      for (const item of raw.inferenceModels) {
+        if (!item || typeof item.name !== "string" || !item.name.trim()) continue;
+        if (isGatewayManagedModelLabel(item.labelOverride)) continue;
+        const name = item.name.trim();
+        if (seen.has(name)) continue;
+        seen.add(name);
+        userModels.push({
+          name,
+          ...typeof item.labelOverride === "string" && item.labelOverride.trim() ? { labelOverride: item.labelOverride.trim() } : {}
+        });
+      }
+    }
+  };
+  if (activePath && existsSync(activePath)) {
+    try {
+      collectFrom(JSON.parse(readFileSync(activePath, "utf8")));
+    } catch {
+    }
   }
-  copyFileSync(activePath, ORIGINAL_PROVIDER_BACKUP);
-  return true;
+  if (existsSync(ORIGINAL_PROVIDER_BACKUP)) {
+    try {
+      collectFrom(JSON.parse(readFileSync(ORIGINAL_PROVIDER_BACKUP, "utf8")));
+    } catch {
+    }
+  }
+  if (!upstreamBaseUrl && userModels.length === 0) {
+    const legacy = findLatestLegacyProviderBackup();
+    if (legacy) {
+      try {
+        collectFrom(JSON.parse(readFileSync(legacy, "utf8")));
+      } catch {
+      }
+    }
+  }
+  return { activePath, upstreamBaseUrl, userModels };
 }
 function applyGatewayToClaude(routes, port) {
   const activePath = getActiveClaudeProviderPath();
   if (!activePath) {
     throw new Error("\u672A\u627E\u5230 Claude \u684C\u9762\u7AEF\u7684\u914D\u7F6E\u5E93 (_meta.json)\uFF0C\u8BF7\u786E\u4FDD\u5DF2\u5B89\u88C5\u5E76\u542F\u52A8\u8FC7 Claude \u684C\u9762\u7AEF\u3002");
   }
-  backupOriginalClaudeProvider();
   const providerConfig = JSON.parse(readFileSync(activePath, "utf8"));
+  const previousBaseUrl = typeof providerConfig.inferenceGatewayBaseUrl === "string" && providerConfig.inferenceGatewayBaseUrl.trim() && !isLocalGatewayUrl(providerConfig.inferenceGatewayBaseUrl) ? providerConfig.inferenceGatewayBaseUrl.trim() : void 0;
   const models = Object.entries(routes).map(([alias, r]) => ({
     name: alias,
     labelOverride: r.label ?? alias
@@ -119,7 +153,10 @@ function applyGatewayToClaude(routes, port) {
   providerConfig.inferenceProvider = "gateway";
   writeFileSync(activePath, `${JSON.stringify(providerConfig, null, 2)}
 `, "utf8");
-  return { activePath, modelCount: models.length };
+  if (existsSync(ORIGINAL_PROVIDER_BACKUP)) {
+    rmSync(ORIGINAL_PROVIDER_BACKUP, { force: true });
+  }
+  return { activePath, modelCount: models.length, previousBaseUrl };
 }
 function findLatestLegacyProviderBackup() {
   const legacyDir = join(homedir(), ".workbuddy-claude", "app-provider-backups");
@@ -140,70 +177,102 @@ function findLatestLegacyProviderBackup() {
   }
   return null;
 }
-function restoreOriginalClaudeProvider() {
+function restoreOriginalClaudeProvider(fallbackBaseUrl) {
   const activePath = getActiveClaudeProviderPath();
   if (!activePath) {
     throw new Error("\u672A\u627E\u5230 Claude \u684C\u9762\u7AEF\u914D\u7F6E\u5E93\u3002");
   }
-  if (!existsSync(ORIGINAL_PROVIDER_BACKUP)) {
-    const legacy = findLatestLegacyProviderBackup();
-    if (legacy) {
-      copyFileSync(legacy, activePath);
-      return { activePath, restored: true };
-    }
-    throw new Error(`\u672A\u627E\u5230\u539F\u59CB\u4EE3\u7406\u914D\u7F6E\u6587\u4EF6\u5907\u4EFD (${ORIGINAL_PROVIDER_BACKUP})\uFF0C\u65E0\u6CD5\u81EA\u52A8\u6062\u590D\u3002`);
+  const { upstreamBaseUrl, userModels } = extractUserProviderConfig();
+  const providerConfig = JSON.parse(readFileSync(activePath, "utf8"));
+  const targetBaseUrl = (fallbackBaseUrl && !isLocalGatewayUrl(fallbackBaseUrl) ? fallbackBaseUrl : void 0) ?? upstreamBaseUrl ?? "https://api.deepseek.com/anthropic";
+  providerConfig.inferenceGatewayBaseUrl = targetBaseUrl;
+  if (Array.isArray(providerConfig.inferenceModels)) {
+    const kept = providerConfig.inferenceModels.filter(
+      (m) => m && !isGatewayManagedModelLabel(m.labelOverride)
+    );
+    providerConfig.inferenceModels = kept.length > 0 ? kept : userModels;
+  } else if (userModels.length > 0) {
+    providerConfig.inferenceModels = userModels;
   }
-  copyFileSync(ORIGINAL_PROVIDER_BACKUP, activePath);
-  rmSync(ORIGINAL_PROVIDER_BACKUP, { force: true });
+  writeFileSync(activePath, `${JSON.stringify(providerConfig, null, 2)}
+`, "utf8");
+  if (existsSync(ORIGINAL_PROVIDER_BACKUP)) {
+    rmSync(ORIGINAL_PROVIDER_BACKUP, { force: true });
+  }
   return { activePath, restored: true };
 }
-function applyGatewayToSettings(port, token, primaryModel = "claude-sonnet-5-5", smallModel = "claude-haiku-5-5") {
+function applyGatewayToSettings(port, token, config) {
   if (!existsSync(CLAUDE_SETTINGS_PATH)) return;
   try {
     const settings = JSON.parse(readFileSync(CLAUDE_SETTINGS_PATH, "utf8"));
-    const currentEnv = settings.env && typeof settings.env === "object" ? settings.env : {};
-    if (!existsSync(ORIGINAL_SETTINGS_ENV_BACKUP) && !isLocalGatewayUrl(currentEnv.ANTHROPIC_BASE_URL)) {
-      mkdirSync(DATA_DIR, { recursive: true });
-      const snapshot = settings.env ? settings.env : { __empty: true };
-      writeFileSync(ORIGINAL_SETTINGS_ENV_BACKUP, `${JSON.stringify(snapshot, null, 2)}
-`, "utf8");
+    const currentEnv = settings.env && typeof settings.env === "object" ? { ...settings.env } : {};
+    if (existsSync(ORIGINAL_SETTINGS_ENV_BACKUP)) {
+      try {
+        const orig = JSON.parse(readFileSync(ORIGINAL_SETTINGS_ENV_BACKUP, "utf8"));
+        if (!("ANTHROPIC_MODEL" in orig) && currentEnv.ANTHROPIC_MODEL) {
+          delete currentEnv.ANTHROPIC_MODEL;
+        }
+        if (!("ANTHROPIC_SMALL_FAST_MODEL" in orig) && currentEnv.ANTHROPIC_SMALL_FAST_MODEL) {
+          delete currentEnv.ANTHROPIC_SMALL_FAST_MODEL;
+        }
+      } catch {
+      }
+      rmSync(ORIGINAL_SETTINGS_ENV_BACKUP, { force: true });
+    }
+    if (config && typeof currentEnv.ANTHROPIC_BASE_URL === "string" && currentEnv.ANTHROPIC_BASE_URL.trim() && !isLocalGatewayUrl(currentEnv.ANTHROPIC_BASE_URL)) {
+      config.passthrough = {
+        ...config.passthrough,
+        settingsBaseUrl: currentEnv.ANTHROPIC_BASE_URL.trim()
+      };
+      saveGatewayConfig(config);
     }
     settings.env = {
       ...currentEnv,
       ANTHROPIC_BASE_URL: `http://127.0.0.1:${port}`,
-      ANTHROPIC_AUTH_TOKEN: currentEnv.ANTHROPIC_AUTH_TOKEN || token,
-      ANTHROPIC_MODEL: primaryModel,
-      ANTHROPIC_SMALL_FAST_MODEL: smallModel
+      ANTHROPIC_AUTH_TOKEN: currentEnv.ANTHROPIC_AUTH_TOKEN || token
     };
     writeFileSync(CLAUDE_SETTINGS_PATH, `${JSON.stringify(settings, null, 2)}
 `, "utf8");
   } catch {
   }
 }
-function restoreOriginalSettings() {
+function restoreOriginalSettings(gatewayToken, previousBaseUrl) {
   if (!existsSync(CLAUDE_SETTINGS_PATH)) return false;
   try {
     const settings = JSON.parse(readFileSync(CLAUDE_SETTINGS_PATH, "utf8"));
+    let changed = false;
     if (existsSync(ORIGINAL_SETTINGS_ENV_BACKUP)) {
-      const saved = JSON.parse(readFileSync(ORIGINAL_SETTINGS_ENV_BACKUP, "utf8"));
-      if (saved.__empty) {
-        delete settings.env;
-      } else {
-        settings.env = saved;
+      try {
+        const orig = JSON.parse(readFileSync(ORIGINAL_SETTINGS_ENV_BACKUP, "utf8"));
+        if (settings.env && typeof settings.env === "object") {
+          if (!("ANTHROPIC_MODEL" in orig) && "ANTHROPIC_MODEL" in settings.env) {
+            delete settings.env.ANTHROPIC_MODEL;
+            changed = true;
+          }
+          if (!("ANTHROPIC_SMALL_FAST_MODEL" in orig) && "ANTHROPIC_SMALL_FAST_MODEL" in settings.env) {
+            delete settings.env.ANTHROPIC_SMALL_FAST_MODEL;
+            changed = true;
+          }
+        }
+      } catch {
       }
-      writeFileSync(CLAUDE_SETTINGS_PATH, `${JSON.stringify(settings, null, 2)}
-`, "utf8");
       rmSync(ORIGINAL_SETTINGS_ENV_BACKUP, { force: true });
-      return true;
     }
     if (settings.env && typeof settings.env === "object" && isLocalGatewayUrl(settings.env.ANTHROPIC_BASE_URL)) {
-      delete settings.env.ANTHROPIC_BASE_URL;
-      delete settings.env.ANTHROPIC_AUTH_TOKEN;
-      delete settings.env.ANTHROPIC_MODEL;
-      delete settings.env.ANTHROPIC_SMALL_FAST_MODEL;
+      if (previousBaseUrl && !isLocalGatewayUrl(previousBaseUrl)) {
+        settings.env.ANTHROPIC_BASE_URL = previousBaseUrl;
+      } else {
+        delete settings.env.ANTHROPIC_BASE_URL;
+      }
+      if (gatewayToken && settings.env.ANTHROPIC_AUTH_TOKEN === gatewayToken) {
+        delete settings.env.ANTHROPIC_AUTH_TOKEN;
+      }
       if (Object.keys(settings.env).length === 0) {
         delete settings.env;
       }
+      changed = true;
+    }
+    if (changed) {
       writeFileSync(CLAUDE_SETTINGS_PATH, `${JSON.stringify(settings, null, 2)}
 `, "utf8");
       return true;
@@ -8815,9 +8884,10 @@ var PassthroughModule = class {
       }
     ];
   }
-  async handleRequest(request, res, context, _targetModel) {
+  async handleRequest(request, res, context, targetModel) {
     const upstreamUrl = `${this.targetUrl.replace(/\/+$/, "")}/v1/messages`;
     const clientKey = context.clientKey;
+    const outboundRequest = targetModel && targetModel !== request.model ? { ...request, model: targetModel } : request;
     const headers = {
       "Content-Type": "application/json",
       "anthropic-version": "2023-06-01"
@@ -8831,7 +8901,7 @@ var PassthroughModule = class {
       upstreamRes = await fetch(upstreamUrl, {
         method: "POST",
         headers,
-        body: JSON.stringify(request)
+        body: JSON.stringify(outboundRequest)
       });
     } catch (err) {
       res.statusCode = 502;
@@ -9147,7 +9217,10 @@ function createGatewayServer(options) {
         await pass.handleRequest(parsed, res, reqContext);
         return;
       }
-      const routeValues = Object.values(config.routes);
+      const isLocalGatewayToken = clientKey === config.token;
+      const routeValues = Object.values(config.routes).filter(
+        (r) => !(isLocalGatewayToken && r.module === "passthrough")
+      );
       const fallbackRoute = (reqModel.includes("haiku") ? routeValues.find((r) => r.targetModel?.includes("flash") || r.label?.includes("Flash")) : void 0) ?? routeValues[0];
       if (fallbackRoute) {
         const mod = host.getModule(fallbackRoute.module);
@@ -9328,13 +9401,41 @@ async function doSyncGatewayRoutes(host, config, options = {}) {
       dataDir: DATA_DIR
     });
   }
-  const aggregated = await host.aggregateModels();
-  if (!aggregated || aggregated.length === 0) {
-    return config.routes;
+  const userProvider = extractUserProviderConfig();
+  if (userProvider.upstreamBaseUrl) {
+    config.passthrough = {
+      ...config.passthrough,
+      deepseekBaseUrl: userProvider.upstreamBaseUrl
+    };
+    host.getPassthroughModule().setBaseUrl(userProvider.upstreamBaseUrl);
   }
+  const aggregated = await host.aggregateModels();
   const newRoutes = {};
   const usedAliases = /* @__PURE__ */ new Set();
-  aggregated.sort((a, b) => {
+  for (const userModel of userProvider.userModels) {
+    if (usedAliases.has(userModel.name)) continue;
+    newRoutes[userModel.name] = {
+      module: "passthrough",
+      targetModel: userModel.name,
+      label: userModel.labelOverride ?? userModel.name
+    };
+    usedAliases.add(userModel.name);
+  }
+  if (userProvider.userModels.length === 0) {
+    for (const item of aggregated) {
+      if (item.module !== "passthrough") continue;
+      const alias = item.model.recommendedAlias || item.model.id;
+      if (usedAliases.has(alias)) continue;
+      newRoutes[alias] = {
+        module: "passthrough",
+        targetModel: item.model.id,
+        label: item.model.labelOverride ?? item.model.name
+      };
+      usedAliases.add(alias);
+    }
+  }
+  const extensionItems = aggregated.filter((item) => item.module !== "passthrough");
+  extensionItems.sort((a, b) => {
     if (a.module === "antigravity" && b.module !== "antigravity") return -1;
     if (a.module !== "antigravity" && b.module === "antigravity") return 1;
     return 0;
@@ -9356,7 +9457,7 @@ async function doSyncGatewayRoutes(host, config, options = {}) {
     }
     return candidates;
   };
-  const eligibleItems = aggregated.filter((item) => item.module !== "passthrough");
+  const eligibleItems = extensionItems;
   const assignedAliases = new Array(eligibleItems.length);
   for (let i = 0; i < eligibleItems.length; i++) {
     const { module: modId, model } = eligibleItems[i];
@@ -9389,11 +9490,19 @@ async function doSyncGatewayRoutes(host, config, options = {}) {
   if (Object.keys(newRoutes).length > 0) {
     config.routes = newRoutes;
     saveGatewayConfig(config);
-    if (options.updateClaude !== false && existsSync7(ORIGINAL_PROVIDER_BACKUP)) {
+    if (options.updateClaude !== false && userProvider.activePath) {
       try {
-        applyGatewayToClaude(newRoutes, config.port);
+        const applied = applyGatewayToClaude(newRoutes, config.port);
+        if (applied.previousBaseUrl) {
+          config.passthrough = {
+            ...config.passthrough,
+            deepseekBaseUrl: applied.previousBaseUrl
+          };
+          host.getPassthroughModule().setBaseUrl(applied.previousBaseUrl);
+          saveGatewayConfig(config);
+        }
         if (!options.silent) {
-          logMessage(`\u2713 \u5DF2\u540C\u6B65\u66F4\u65B0 Claude \u684C\u9762\u7AEF\u6A21\u578B\u5217\u8868\uFF08\u5171 ${Object.keys(newRoutes).length} \u4E2A\u6A21\u578B\uFF09`);
+          logMessage(`\u2713 \u5DF2\u540C\u6B65\u66F4\u65B0\u7528\u6237\u914D\u7F6E\u4E2D\u7684\u6A21\u578B\u5217\u8868\uFF08\u5171 ${Object.keys(newRoutes).length} \u4E2A\u6A21\u578B\uFF09`);
         }
       } catch (err) {
         if (!options.silent) {
@@ -9442,6 +9551,9 @@ async function main() {
   const host = new ModuleHost();
   if (config.antigravity?.apiKey) {
     host.getAntigravityModule().setApiKey(config.antigravity.apiKey);
+  }
+  if (config.passthrough?.deepseekBaseUrl) {
+    host.getPassthroughModule().setBaseUrl(config.passthrough.deepseekBaseUrl);
   }
   if (command === "on" || command === "enable") {
     const isSilent = process.argv.includes("--silent");
@@ -9497,19 +9609,23 @@ async function main() {
     if (!freshRoutes) {
       freshRoutes = await syncGatewayRoutes(host, currentConfig, { silent: isSilent });
     }
-    const routeAliases = Object.keys(freshRoutes);
-    const primaryAlias = routeAliases[1] ?? routeAliases[0] ?? "claude-sonnet-5-5";
-    const smallAlias = routeAliases.find((a) => freshRoutes[a]?.targetModel?.includes("flash")) ?? routeAliases[0] ?? "claude-haiku-5-5";
-    applyGatewayToSettings(currentConfig.port, currentConfig.token, primaryAlias, smallAlias);
+    applyGatewayToSettings(currentConfig.port, currentConfig.token, currentConfig);
     try {
       const res = applyGatewayToClaude(freshRoutes, currentConfig.port);
+      if (res.previousBaseUrl) {
+        currentConfig.passthrough = {
+          ...currentConfig.passthrough,
+          deepseekBaseUrl: res.previousBaseUrl
+        };
+        saveGatewayConfig(currentConfig);
+      }
       if (!isSilent) {
         process.stdout.write(`
-\u2713 agent-gateway \u7F51\u5173\u5DF2\u6210\u529F\u5F00\u542F\u5E76\u63A5\u5165 Claude \u684C\u9762\u7AEF\u4E0E CLI\uFF01
+\u2713 agent-gateway \u7F51\u5173\u5DF2\u6210\u529F\u5F00\u542F\u5E76\u5199\u5165\u7528\u6237\u914D\u7F6E\uFF01
 `);
         process.stdout.write(`  \u7F51\u5173\u76D1\u542C: http://127.0.0.1:${currentConfig.port}
 `);
-        process.stdout.write(`  \u5DF2\u6CE8\u5165\u6A21\u578B: ${res.modelCount} \u4E2A
+        process.stdout.write(`  \u5DF2\u5199\u5165\u6A21\u578B: ${res.modelCount} \u4E2A\uFF08\u5DF2\u4FDD\u7559\u7528\u6237\u539F\u6709\u81EA\u914D\u6A21\u578B\uFF09
 `);
         process.stdout.write(`  \u63D0\u793A: \u82E5\u5F53\u524D Claude \u684C\u9762\u7AEF\u6B63\u5728\u8FD0\u884C\uFF0C\u91CD\u542F\u684C\u9762\u7AEF\u5373\u53EF\u751F\u6548\u6700\u65B0\u6A21\u578B\u3002
 
@@ -9532,12 +9648,12 @@ async function main() {
     process.exit(0);
   }
   if (command === "off" || command === "disable") {
-    process.stdout.write("\u6B63\u5728\u5173\u95ED agent-gateway \u7F51\u5173\u5E76\u8FD8\u539F\u539F\u672C\u914D\u7F6E...\n");
+    process.stdout.write("\u6B63\u5728\u5173\u95ED agent-gateway \u7F51\u5173\u5E76\u8FD8\u539F\u7528\u6237\u914D\u7F6E...\n");
     stopGatewayDaemons(config.port);
-    const settingsRestored = restoreOriginalSettings();
+    const settingsRestored = restoreOriginalSettings(config.token, config.passthrough?.settingsBaseUrl);
     try {
-      restoreOriginalClaudeProvider();
-      process.stdout.write(`\u2713 \u5DF2\u5B8C\u6574\u8FD8\u539F Claude \u684C\u9762\u7AEF\u539F\u672C\u7684\u4EE3\u7406/\u8D26\u53F7\u914D\u7F6E${settingsRestored ? "\uFF08\u53CA CLI \u73AF\u5883\uFF09" : ""}\uFF01
+      restoreOriginalClaudeProvider(config.passthrough?.deepseekBaseUrl);
+      process.stdout.write(`\u2713 \u5DF2\u79FB\u9664\u7F51\u5173\u6CE8\u5165\u6761\u76EE\u5E76\u8FD8\u539F\u7528\u6237\u914D\u7F6E${settingsRestored ? "\uFF08\u542B CLI settings.json\uFF09" : ""}\uFF01
 `);
       process.stdout.write(`  \u63D0\u793A: \u82E5\u5F53\u524D\u6B63\u5728\u684C\u9762\u7AEF\u4E2D\u4F7F\u7528\u7F51\u5173\uFF0C\u8BF7\u5F00\u542F\u65B0\u4F1A\u8BDD\u6216\u91CD\u542F Claude \u684C\u9762\u7AEF\u4F7F\u5176\u751F\u6548\u3002
 

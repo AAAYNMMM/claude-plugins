@@ -255,7 +255,10 @@ export function createGatewayServer(options: ServerOptions): {
       }
 
       // 若是后台发出的未登记 claude-* 请求（例如标题生成/摘要模型），智能映射到已登记的轻量或首条可用路由
-      const routeValues = Object.values(config.routes)
+      const isLocalGatewayToken = clientKey === config.token
+      const routeValues = Object.values(config.routes).filter(
+        (r) => !(isLocalGatewayToken && r.module === 'passthrough')
+      )
       const fallbackRoute =
         (reqModel.includes('haiku')
           ? routeValues.find((r) => r.targetModel?.includes('flash') || r.label?.includes('Flash'))

@@ -1,5 +1,5 @@
 /**
- * 网关配置中心与 Claude Desktop / CLI 隔离切换管理器。
+ * 网关配置中心与 Claude Desktop / CLI 用户配置联动管理器。
  */
 
 import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
@@ -90,49 +90,99 @@ export function getActiveClaudeProviderPath(): string | null {
   return null
 }
 
-/**
- * 备份原本的 Claude 桌面端配置（仅在尚未备份过、且当前不是网关本身时创建，确保原始配置不被污染）
- */
-export function backupOriginalClaudeProvider(): boolean {
-  const activePath = getActiveClaudeProviderPath()
-  if (!activePath) return false
+export interface ClaudeProviderModelEntry {
+  name: string
+  labelOverride?: string
+}
 
-  mkdirSync(DATA_DIR, { recursive: true })
-  if (existsSync(ORIGINAL_PROVIDER_BACKUP)) return false
-
-  try {
-    const raw = JSON.parse(readFileSync(activePath, 'utf8'))
-    if (isLocalGatewayUrl(raw.inferenceGatewayBaseUrl)) {
-      // 当前活跃配置已是本地网关，不能覆盖为“原始配置”
-      return false
-    }
-  } catch {
-    return false
-  }
-
-  copyFileSync(activePath, ORIGINAL_PROVIDER_BACKUP)
-  return true
+/** 判断一条模型展示名称是否属于网关自动注入的 AGY / WB 条目 */
+export function isGatewayManagedModelLabel(label?: unknown): boolean {
+  return typeof label === 'string' && (label.startsWith('AGY · ') || label.startsWith('WB · '))
 }
 
 /**
- * 将网关接入 Claude 桌面端：只动端点和模型列表，保留应用私有加密密钥
+ * 从用户当前生效的 Claude 桌面端配置直接读取用户自配模型与原上游地址；
+ * 若此前版本曾生成隔离备份 (original-provider.json)，顺带将其用户模型与原上游地址迁回并合并。
+ */
+export function extractUserProviderConfig(): {
+  activePath: string | null
+  upstreamBaseUrl?: string
+  userModels: ClaudeProviderModelEntry[]
+} {
+  const activePath = getActiveClaudeProviderPath()
+  const userModels: ClaudeProviderModelEntry[] = []
+  const seen = new Set<string>()
+  let upstreamBaseUrl: string | undefined
+
+  const collectFrom = (raw: any) => {
+    if (!raw || typeof raw !== 'object') return
+    if (!upstreamBaseUrl && typeof raw.inferenceGatewayBaseUrl === 'string' && raw.inferenceGatewayBaseUrl.trim() && !isLocalGatewayUrl(raw.inferenceGatewayBaseUrl)) {
+      upstreamBaseUrl = raw.inferenceGatewayBaseUrl.trim()
+    }
+    if (Array.isArray(raw.inferenceModels)) {
+      for (const item of raw.inferenceModels) {
+        if (!item || typeof item.name !== 'string' || !item.name.trim()) continue
+        if (isGatewayManagedModelLabel(item.labelOverride)) continue
+        const name = item.name.trim()
+        if (seen.has(name)) continue
+        seen.add(name)
+        userModels.push({
+          name,
+          ...(typeof item.labelOverride === 'string' && item.labelOverride.trim()
+            ? { labelOverride: item.labelOverride.trim() }
+            : {}),
+        })
+      }
+    }
+  }
+
+  if (activePath && existsSync(activePath)) {
+    try {
+      collectFrom(JSON.parse(readFileSync(activePath, 'utf8')))
+    } catch {}
+  }
+
+  // 兼容迁移：若早期版本隔离出了 original-provider.json，把里面的用户原始模型和地址迁回用户配置
+  if (existsSync(ORIGINAL_PROVIDER_BACKUP)) {
+    try {
+      collectFrom(JSON.parse(readFileSync(ORIGINAL_PROVIDER_BACKUP, 'utf8')))
+    } catch {}
+  }
+
+  if (!upstreamBaseUrl && userModels.length === 0) {
+    const legacy = findLatestLegacyProviderBackup()
+    if (legacy) {
+      try {
+        collectFrom(JSON.parse(readFileSync(legacy, 'utf8')))
+      } catch {}
+    }
+  }
+
+  return { activePath, upstreamBaseUrl, userModels }
+}
+
+/**
+ * 直接更新用户 Claude 桌面端配置：保留用户所有既有凭据与自配模型，把网关映射写入当前活跃配置
  */
 export function applyGatewayToClaude(routes: Record<string, RouteConfig>, port: number): {
   activePath: string
   modelCount: number
+  previousBaseUrl?: string
 } {
   const activePath = getActiveClaudeProviderPath()
   if (!activePath) {
     throw new Error('未找到 Claude 桌面端的配置库 (_meta.json)，请确保已安装并启动过 Claude 桌面端。')
   }
 
-  // 1. 确保原始配置已安全备份
-  backupOriginalClaudeProvider()
-
-  // 2. 读取当前活跃配置
   const providerConfig = JSON.parse(readFileSync(activePath, 'utf8'))
+  const previousBaseUrl =
+    typeof providerConfig.inferenceGatewayBaseUrl === 'string' &&
+    providerConfig.inferenceGatewayBaseUrl.trim() &&
+    !isLocalGatewayUrl(providerConfig.inferenceGatewayBaseUrl)
+      ? providerConfig.inferenceGatewayBaseUrl.trim()
+      : undefined
 
-  // 3. 构建模型映射条目
+  // 构建模型映射条目（其中已前置保留用户原本的自配模型）
   const models = Object.entries(routes).map(([alias, r]) => ({
     name: alias,
     labelOverride: r.label ?? alias,
@@ -144,7 +194,12 @@ export function applyGatewayToClaude(routes: Record<string, RouteConfig>, port: 
 
   writeFileSync(activePath, `${JSON.stringify(providerConfig, null, 2)}\n`, 'utf8')
 
-  return { activePath, modelCount: models.length }
+  // 用户配置已直接包含原模型与上游，不再保留旧隔离备份文件
+  if (existsSync(ORIGINAL_PROVIDER_BACKUP)) {
+    rmSync(ORIGINAL_PROVIDER_BACKUP, { force: true })
+  }
+
+  return { activePath, modelCount: models.length, previousBaseUrl }
 }
 
 /**
@@ -174,57 +229,86 @@ function findLatestLegacyProviderBackup(): string | null {
 }
 
 /**
- * 关闭网关，完整恢复用户原本的 Claude 桌面端代理/账号配置
+ * 关闭网关时直接编辑用户 Claude 桌面端配置：仅移除网关注入的 AGY / WB 条目并恢复原上游地址，完整保留用户自配模型
  */
-export function restoreOriginalClaudeProvider(): { activePath: string; restored: boolean } {
+export function restoreOriginalClaudeProvider(fallbackBaseUrl?: string): { activePath: string; restored: boolean } {
   const activePath = getActiveClaudeProviderPath()
   if (!activePath) {
     throw new Error('未找到 Claude 桌面端配置库。')
   }
 
-  if (!existsSync(ORIGINAL_PROVIDER_BACKUP)) {
-    const legacy = findLatestLegacyProviderBackup()
-    if (legacy) {
-      copyFileSync(legacy, activePath)
-      return { activePath, restored: true }
-    }
-    throw new Error(`未找到原始代理配置文件备份 (${ORIGINAL_PROVIDER_BACKUP})，无法自动恢复。`)
+  const { upstreamBaseUrl, userModels } = extractUserProviderConfig()
+  const providerConfig = JSON.parse(readFileSync(activePath, 'utf8'))
+
+  const targetBaseUrl =
+    (fallbackBaseUrl && !isLocalGatewayUrl(fallbackBaseUrl) ? fallbackBaseUrl : undefined) ??
+    upstreamBaseUrl ??
+    'https://api.deepseek.com/anthropic'
+
+  providerConfig.inferenceGatewayBaseUrl = targetBaseUrl
+
+  if (Array.isArray(providerConfig.inferenceModels)) {
+    const kept = providerConfig.inferenceModels.filter(
+      (m: any) => m && !isGatewayManagedModelLabel(m.labelOverride)
+    )
+    providerConfig.inferenceModels = kept.length > 0 ? kept : userModels
+  } else if (userModels.length > 0) {
+    providerConfig.inferenceModels = userModels
   }
 
-  copyFileSync(ORIGINAL_PROVIDER_BACKUP, activePath)
-  // 恢复后移除网关备份，以便用户下次修改原本代理后再启动时捕获最新配置
-  rmSync(ORIGINAL_PROVIDER_BACKUP, { force: true })
+  writeFileSync(activePath, `${JSON.stringify(providerConfig, null, 2)}\n`, 'utf8')
+
+  if (existsSync(ORIGINAL_PROVIDER_BACKUP)) {
+    rmSync(ORIGINAL_PROVIDER_BACKUP, { force: true })
+  }
 
   return { activePath, restored: true }
 }
 
 /**
- * 同步更新 ~/.claude/settings.json 的环境变量，实现 CLI 与 Code 标签页与网关联动开关
+ * 同步更新 ~/.claude/settings.json 的环境变量：只设置网关连接地址与缺省令牌，不覆盖用户的模型设置，不搞隔离备份
  */
 export function applyGatewayToSettings(
   port: number,
   token: string,
-  primaryModel = 'claude-sonnet-5-5',
-  smallModel = 'claude-haiku-5-5'
+  config?: GatewayConfig
 ): void {
   if (!existsSync(CLAUDE_SETTINGS_PATH)) return
   try {
     const settings = JSON.parse(readFileSync(CLAUDE_SETTINGS_PATH, 'utf8')) as Record<string, any>
-    const currentEnv = (settings.env && typeof settings.env === 'object') ? settings.env : {}
+    const currentEnv = (settings.env && typeof settings.env === 'object') ? { ...settings.env } : {}
 
-    // 仅在尚未备份且原本不是指向本地网关时备份原 env
-    if (!existsSync(ORIGINAL_SETTINGS_ENV_BACKUP) && !isLocalGatewayUrl(currentEnv.ANTHROPIC_BASE_URL)) {
-      mkdirSync(DATA_DIR, { recursive: true })
-      const snapshot = settings.env ? settings.env : { __empty: true }
-      writeFileSync(ORIGINAL_SETTINGS_ENV_BACKUP, `${JSON.stringify(snapshot, null, 2)}\n`, 'utf8')
+    // 若早期版本生成过隔离备份 original-settings-env.json，清理当时强行写入的模型覆盖键，仅保留用户原本自配项
+    if (existsSync(ORIGINAL_SETTINGS_ENV_BACKUP)) {
+      try {
+        const orig = JSON.parse(readFileSync(ORIGINAL_SETTINGS_ENV_BACKUP, 'utf8')) as Record<string, any>
+        if (!('ANTHROPIC_MODEL' in orig) && currentEnv.ANTHROPIC_MODEL) {
+          delete currentEnv.ANTHROPIC_MODEL
+        }
+        if (!('ANTHROPIC_SMALL_FAST_MODEL' in orig) && currentEnv.ANTHROPIC_SMALL_FAST_MODEL) {
+          delete currentEnv.ANTHROPIC_SMALL_FAST_MODEL
+        }
+      } catch {}
+      rmSync(ORIGINAL_SETTINGS_ENV_BACKUP, { force: true })
+    }
+
+    if (
+      config &&
+      typeof currentEnv.ANTHROPIC_BASE_URL === 'string' &&
+      currentEnv.ANTHROPIC_BASE_URL.trim() &&
+      !isLocalGatewayUrl(currentEnv.ANTHROPIC_BASE_URL)
+    ) {
+      config.passthrough = {
+        ...config.passthrough,
+        settingsBaseUrl: currentEnv.ANTHROPIC_BASE_URL.trim(),
+      }
+      saveGatewayConfig(config)
     }
 
     settings.env = {
       ...currentEnv,
       ANTHROPIC_BASE_URL: `http://127.0.0.1:${port}`,
       ANTHROPIC_AUTH_TOKEN: currentEnv.ANTHROPIC_AUTH_TOKEN || token,
-      ANTHROPIC_MODEL: primaryModel,
-      ANTHROPIC_SMALL_FAST_MODEL: smallModel,
     }
 
     writeFileSync(CLAUDE_SETTINGS_PATH, `${JSON.stringify(settings, null, 2)}\n`, 'utf8')
@@ -232,34 +316,47 @@ export function applyGatewayToSettings(
 }
 
 /**
- * 停止网关时同步恢复 ~/.claude/settings.json 的原始 env 配置，避免 Code 标签页继续指向已关闭的端口
+ * 停止网关时直接还原 ~/.claude/settings.json 中的本地网关连接字段，保留用户自己的全部配置
  */
-export function restoreOriginalSettings(): boolean {
+export function restoreOriginalSettings(gatewayToken?: string, previousBaseUrl?: string): boolean {
   if (!existsSync(CLAUDE_SETTINGS_PATH)) return false
   try {
     const settings = JSON.parse(readFileSync(CLAUDE_SETTINGS_PATH, 'utf8')) as Record<string, any>
+    let changed = false
 
     if (existsSync(ORIGINAL_SETTINGS_ENV_BACKUP)) {
-      const saved = JSON.parse(readFileSync(ORIGINAL_SETTINGS_ENV_BACKUP, 'utf8'))
-      if (saved.__empty) {
-        delete settings.env
-      } else {
-        settings.env = saved
-      }
-      writeFileSync(CLAUDE_SETTINGS_PATH, `${JSON.stringify(settings, null, 2)}\n`, 'utf8')
+      try {
+        const orig = JSON.parse(readFileSync(ORIGINAL_SETTINGS_ENV_BACKUP, 'utf8')) as Record<string, any>
+        if (settings.env && typeof settings.env === 'object') {
+          if (!('ANTHROPIC_MODEL' in orig) && 'ANTHROPIC_MODEL' in settings.env) {
+            delete settings.env.ANTHROPIC_MODEL
+            changed = true
+          }
+          if (!('ANTHROPIC_SMALL_FAST_MODEL' in orig) && 'ANTHROPIC_SMALL_FAST_MODEL' in settings.env) {
+            delete settings.env.ANTHROPIC_SMALL_FAST_MODEL
+            changed = true
+          }
+        }
+      } catch {}
       rmSync(ORIGINAL_SETTINGS_ENV_BACKUP, { force: true })
-      return true
     }
 
-    // 即使没有备份文件，如果 settings.env 指向本机网关，也必须安全清理掉网关链接字段避免断连
     if (settings.env && typeof settings.env === 'object' && isLocalGatewayUrl(settings.env.ANTHROPIC_BASE_URL)) {
-      delete settings.env.ANTHROPIC_BASE_URL
-      delete settings.env.ANTHROPIC_AUTH_TOKEN
-      delete settings.env.ANTHROPIC_MODEL
-      delete settings.env.ANTHROPIC_SMALL_FAST_MODEL
+      if (previousBaseUrl && !isLocalGatewayUrl(previousBaseUrl)) {
+        settings.env.ANTHROPIC_BASE_URL = previousBaseUrl
+      } else {
+        delete settings.env.ANTHROPIC_BASE_URL
+      }
+      if (gatewayToken && settings.env.ANTHROPIC_AUTH_TOKEN === gatewayToken) {
+        delete settings.env.ANTHROPIC_AUTH_TOKEN
+      }
       if (Object.keys(settings.env).length === 0) {
         delete settings.env
       }
+      changed = true
+    }
+
+    if (changed) {
       writeFileSync(CLAUDE_SETTINGS_PATH, `${JSON.stringify(settings, null, 2)}\n`, 'utf8')
       return true
     }

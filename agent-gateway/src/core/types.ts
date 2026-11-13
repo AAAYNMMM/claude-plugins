@@ -106,6 +106,7 @@ export interface GatewayConfig {
   }
   passthrough?: {
     deepseekBaseUrl?: string
+    settingsBaseUrl?: string
   }
 }
 

@@ -45,10 +45,14 @@ export class PassthroughModule implements GatewayModule {
     request: AnthropicRequest,
     res: ServerResponse,
     context: RequestContext,
-    _targetModel?: string
+    targetModel?: string
   ): Promise<void> {
     const upstreamUrl = `${this.targetUrl.replace(/\/+$/, '')}/v1/messages`
     const clientKey = context.clientKey
+    const outboundRequest =
+      targetModel && targetModel !== request.model
+        ? { ...request, model: targetModel }
+        : request
 
     const headers: Record<string, string> = {
       'Content-Type': 'application/json',
@@ -64,7 +68,7 @@ export class PassthroughModule implements GatewayModule {
       upstreamRes = await fetch(upstreamUrl, {
         method: 'POST',
         headers,
-        body: JSON.stringify(request),
+        body: JSON.stringify(outboundRequest),
       })
     } catch (err: any) {
       res.statusCode = 502
