@@ -1,6 +1,6 @@
 {
   "name": "agent-gateway",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "private": true,
   "description": "Claude Code & Claude Desktop 聚合网关插件（支持 WorkBuddy、反重力与直连代理）",
   "type": "module",

@@ -31,7 +31,7 @@ import { GatewayRouter } from '../src/core/router.ts'
 import { createGatewayServer } from '../src/core/server.ts'
 import type { AnthropicRequest, GatewayConfig, GatewayModule, RouteAttemptResult } from '../src/core/types.ts'
 import { antigravityAuth } from '../src/modules/antigravity/auth.ts'
-import { cleanSchemaForGemini, toGeminiRequest } from '../src/modules/antigravity/gemini-converter.ts'
+import { cleanSchemaForGemini, hashThinkingText, toGeminiRequest } from '../src/modules/antigravity/gemini-converter.ts'
 import { AntigravityModule, normalizeAntigravityErrorStatus } from '../src/modules/antigravity/index.ts'
 import {
   fetchLiveProjectAndTier,
@@ -1079,5 +1079,248 @@ describe('WorkBuddy channel_reject & reasoning_content fixes', () => {
       () => {}
     )
     assert.equal(collected.stop_reason, 'max_tokens')
+  })
+})
+
+describe('Antigravity v1internal protocol completeness fixes', () => {
+  it('preserves functionCall.id, functionResponse.id, contiguous tool responses, media/documents, tool_choice, generation params, and schema $ref/allOf', () => {
+    const cleaned = cleanSchemaForGemini({
+      type: 'object',
+      $defs: {
+        Item: {
+          allOf: [
+            { type: 'object', properties: { name: { type: 'string' } }, required: ['name'] },
+            { properties: { tags: { type: 'array' } } },
+          ],
+        },
+      },
+      properties: {
+        item: { $ref: '#/$defs/Item', description: 'Target item' },
+      },
+      required: ['item'],
+    }) as any
+
+    assert.equal(cleaned.properties.item.type, 'object')
+    assert.equal(cleaned.properties.item.description, 'Target item')
+    assert.equal(cleaned.properties.item.properties.name.type, 'string')
+    assert.deepEqual(cleaned.properties.item.properties.tags.items, { type: 'string' })
+    assert.deepEqual(cleaned.properties.item.required, ['name'])
+
+    const thinkingSigMap = new Map<string, string>([
+      [hashThinkingText('chain of thought'), 'vrtx-sig-123'],
+    ])
+
+    const gem = toGeminiRequest(
+      {
+        model: 'claude-sonnet-5-5-medium',
+        max_tokens: 4096,
+        temperature: 0.4,
+        top_p: 0.9,
+        top_k: 40,
+        stop_sequences: ['STOP_HERE'],
+        thinking: { type: 'adaptive' },
+        output_config: { effort: 'high' },
+        tools: [
+          {
+            name: 'web_search',
+            description: 'Search web',
+            input_schema: { type: 'object', properties: { q: { type: 'string' } } },
+          },
+        ],
+        tool_choice: { type: 'tool', name: 'web_search' },
+        messages: [
+          {
+            role: 'user',
+            content: [
+              { type: 'text', text: 'Analyze this' },
+              { type: 'image', source: { type: 'url', url: 'https://example.com/a.png', media_type: 'image/png' } } as any,
+              { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: 'JVBERi0x' } } as any,
+            ],
+          },
+          {
+            role: 'assistant',
+            content: [
+              { type: 'thinking', thinking: 'chain of thought' } as any,
+              { type: 'thinking', thinking: 'unsigned thought without cache' } as any,
+              { type: 'text', text: 'Searching...' },
+              { type: 'tool_use', id: 'toolu_vrtx_001', name: 'web_search', input: { q: 'news' } } as any,
+              { type: 'tool_use', id: 'toolu_vrtx_002', name: 'web_search', input: { q: 'events' } } as any,
+            ],
+          },
+          {
+            role: 'user',
+            content: [
+              {
+                type: 'tool_result',
+                tool_use_id: 'toolu_vrtx_001',
+                content: [
+                  { type: 'text', text: 'result 1' },
+                  { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'iVBORw==' } },
+                ],
+              } as any,
+              {
+                type: 'tool_result',
+                tool_use_id: 'toolu_vrtx_002',
+                content: 'result 2',
+              } as any,
+            ],
+          },
+        ],
+      },
+      { thoughtSignatureByThinkingHash: thinkingSigMap }
+    )
+
+    assert.equal(gem.generationConfig?.topP, 0.9)
+    assert.equal(gem.generationConfig?.topK, 40)
+    assert.deepEqual(gem.generationConfig?.stopSequences, ['STOP_HERE'])
+    assert.equal(gem.generationConfig?.thinkingConfig?.thinkingBudget, 8192)
+    assert.deepEqual(gem.toolConfig, {
+      functionCallingConfig: { mode: 'ANY', allowedFunctionNames: ['web_search'] },
+    })
+
+    // User turn preserves text + fileData + PDF inlineData
+    assert.equal(gem.contents[0].parts[1].fileData?.fileUri, 'https://example.com/a.png')
+    assert.equal(gem.contents[0].parts[2].inlineData?.mimeType, 'application/pdf')
+
+    // Model turn preserves signed thinking (drops unsigned), text, and functionCall.id
+    const modelParts = gem.contents[1].parts
+    assert.equal(modelParts.length, 4)
+    assert.deepEqual(modelParts[0], { thought: true, text: 'chain of thought', thoughtSignature: 'vrtx-sig-123' })
+    assert.equal(modelParts[1].text, 'Searching...')
+    assert.equal(modelParts[2].functionCall?.id, 'toolu_vrtx_001')
+    assert.equal(modelParts[3].functionCall?.id, 'toolu_vrtx_002')
+
+    // Tool result turn keeps all functionResponse parts contiguous with id before deferred tool images
+    const resultParts = gem.contents[2].parts
+    assert.equal(resultParts.length, 3)
+    assert.equal(resultParts[0].functionResponse?.id, 'toolu_vrtx_001')
+    assert.equal(resultParts[0].functionResponse?.name, 'web_search')
+    assert.equal(resultParts[1].functionResponse?.id, 'toolu_vrtx_002')
+    assert.equal(resultParts[1].functionResponse?.name, 'web_search')
+    assert.equal(resultParts[2].inlineData?.data, 'iVBORw==')
+  })
+
+  it('preserves upstream functionCall.id and caches thinking signature in both stream and non-stream modes', async () => {
+    const mod = new AntigravityModule()
+    await mod.init({ gatewayPort: 0, log: () => {}, dataDir: '' })
+
+    const origTokenFn = antigravityAuth.getAccessToken
+    const origFetch = globalThis.fetch
+    let callCount = 0
+    let secondTurnBody: any = null
+
+    antigravityAuth.getAccessToken = async () => 'tok-vrtx-id'
+    globalThis.fetch = (async (input: string | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url.includes(':loadCodeAssist')) {
+        return new Response(JSON.stringify({ cloudaicompanionProject: 'proj-vrtx' }), { status: 200 })
+      }
+      if (url.includes(':fetchAvailableModels')) {
+        return new Response(
+          JSON.stringify({
+            agentModelSorts: [{ groups: [{ modelIds: ['claude-sonnet-5-5-medium'] }] }],
+            models: { 'claude-sonnet-5-5-medium': { displayName: 'Claude Sonnet 5.5', maxOutputTokens: 8192 } },
+          }),
+          { status: 200 }
+        )
+      }
+      callCount++
+      if (callCount === 1) {
+        return new Response(
+          makeSseBody([
+            {
+              response: {
+                candidates: [
+                  {
+                    content: {
+                      role: 'model',
+                      parts: [
+                        { thought: true, text: 'pondering', thoughtSignature: 'vrtx-think-sig' },
+                        { functionCall: { id: 'toolu_vrtx_upstream_99', name: 'search', args: { q: 'ai' } } },
+                        { functionCall: { name: '', args: {} } },
+                      ],
+                    },
+                    finishReason: 'STOP',
+                  },
+                ],
+              },
+            },
+          ]),
+          { status: 200, headers: { 'Content-Type': 'text/event-stream' } }
+        )
+      }
+      secondTurnBody = JSON.parse(String(init?.body))
+      return new Response(
+        JSON.stringify({
+          response: {
+            candidates: [
+              {
+                content: {
+                  role: 'model',
+                  parts: [{ functionCall: { id: 'toolu_vrtx_nonstream_88', name: 'fetch', args: { id: 1 } } }],
+                },
+                finishReason: 'STOP',
+              },
+            ],
+          },
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      )
+    }) as any
+
+    try {
+      const res1 = new MockServerResponse()
+      const r1 = await mod.tryHandleRequest(
+        {
+          model: 'claude-sonnet-5-5-medium',
+          stream: true,
+          messages: [{ role: 'user', content: 'search ai' }],
+        },
+        res1 as unknown as ServerResponse,
+        { req: {} as any, headers: {}, log: () => {} },
+        'claude-sonnet-5-5-medium'
+      )
+      assert.equal(r1.committed, true)
+      const sse1 = res1.text()
+      assert.ok(sse1.includes('"id":"toolu_vrtx_upstream_99"'))
+      assert.equal(sse1.includes('signature_delta'), false)
+
+      // Turn 2 (non-stream): send back thinking + tool_use + tool_result
+      const res2 = new MockServerResponse()
+      const r2 = await mod.tryHandleRequest(
+        {
+          model: 'claude-sonnet-5-5-medium',
+          stream: false,
+          messages: [
+            { role: 'user', content: 'search ai' },
+            {
+              role: 'assistant',
+              content: [
+                { type: 'thinking', thinking: 'pondering' } as any,
+                { type: 'tool_use', id: 'toolu_vrtx_upstream_99', name: 'search', input: { q: 'ai' } } as any,
+              ],
+            },
+            {
+              role: 'user',
+              content: [{ type: 'tool_result', tool_use_id: 'toolu_vrtx_upstream_99', content: 'done' } as any],
+            },
+          ],
+        },
+        res2 as unknown as ServerResponse,
+        { req: {} as any, headers: {}, log: () => {} },
+        'claude-sonnet-5-5-medium'
+      )
+      assert.equal(r2.committed, true)
+      assert.equal(secondTurnBody.request.contents[1].parts[0].thoughtSignature, 'vrtx-think-sig')
+      assert.equal(secondTurnBody.request.contents[1].parts[1].functionCall.id, 'toolu_vrtx_upstream_99')
+      assert.equal(secondTurnBody.request.contents[2].parts[0].functionResponse.id, 'toolu_vrtx_upstream_99')
+
+      const json2 = JSON.parse(res2.text())
+      assert.equal(json2.content[0].id, 'toolu_vrtx_nonstream_88')
+    } finally {
+      antigravityAuth.getAccessToken = origTokenFn
+      globalThis.fetch = origFetch
+      invalidateAntigravityModelCaches()
+    }
   })
 })

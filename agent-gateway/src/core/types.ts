@@ -47,10 +47,14 @@ export interface AnthropicRequest {
   system?: string | Array<{ type: string; text: string }>
   max_tokens?: number
   temperature?: number
+  top_p?: number
+  top_k?: number
+  stop_sequences?: string[]
   stream?: boolean
   tools?: AnthropicTool[]
-  tool_choice?: { type: string; name?: string }
+  tool_choice?: { type: string; name?: string; disable_parallel_tool_use?: boolean }
   thinking?: { type: string; budget_tokens?: number }
+  output_config?: { effort?: string; [key: string]: unknown }
   [key: string]: unknown
 }
 

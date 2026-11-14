@@ -29,7 +29,7 @@ import {
   getQuotaBucket,
   resolveUpstreamModel,
 } from './models.ts'
-import { toGeminiRequest } from './gemini-converter.ts'
+import { hashThinkingText, toGeminiRequest } from './gemini-converter.ts'
 import { errorPayload, errorTypeForStatus } from '../../core/protocol/anthropic.ts'
 import { antigravityAuth } from './auth.ts'
 
@@ -144,14 +144,24 @@ export class AntigravityModule implements GatewayModule {
   private nextDispatchAt = 0
   private readonly bucketRateLimitUntil = new Map<string, number>()
   private readonly toolThoughtSignatures = new Map<string, string>()
+  private readonly thoughtTextSignatures = new Map<string, string>()
+
+  private setBoundedCache(cache: Map<string, string>, key: string, value: string): void {
+    if (!key || !value) return
+    if (cache.size >= MAX_THOUGHT_SIG_CACHE) {
+      const oldestKey = cache.keys().next().value
+      if (oldestKey) cache.delete(oldestKey)
+    }
+    cache.set(key, value)
+  }
 
   private cacheThoughtSignature(toolUseId: string, signature: string): void {
-    if (!toolUseId || !signature) return
-    if (this.toolThoughtSignatures.size >= MAX_THOUGHT_SIG_CACHE) {
-      const oldestKey = this.toolThoughtSignatures.keys().next().value
-      if (oldestKey) this.toolThoughtSignatures.delete(oldestKey)
-    }
-    this.toolThoughtSignatures.set(toolUseId, signature)
+    this.setBoundedCache(this.toolThoughtSignatures, toolUseId, signature)
+  }
+
+  private cacheThinkingTextSignature(thinkingText: string, signature: string): void {
+    if (!thinkingText || !signature) return
+    this.setBoundedCache(this.thoughtTextSignatures, hashThinkingText(thinkingText), signature)
   }
 
   private async acquireSlot(signal: AbortSignal): Promise<void> {
@@ -262,9 +272,12 @@ export class AntigravityModule implements GatewayModule {
     const bucket = getQuotaBucket(upstreamModel)
     const { projectId } = await fetchLiveProjectAndTier(accessToken)
 
+    const isGeminiModel = upstreamModel.toLowerCase().includes('gemini')
     const geminiBody = toGeminiRequest(request, {
       thoughtSignatureByToolId: this.toolThoughtSignatures,
-      fallbackThoughtSignature: upstreamModel.toLowerCase().includes('gemini')
+      thoughtSignatureByThinkingHash: this.thoughtTextSignatures,
+      allowClientThinkingSignature: !isGeminiModel,
+      fallbackThoughtSignature: isGeminiModel
         ? 'skip_thought_signature_validator'
         : undefined,
     })
@@ -459,6 +472,17 @@ export class AntigravityModule implements GatewayModule {
         let firstStreamError: { status: number; message: string } | null = null
         let postStartStreamError: { status: number; message: string } | null = null
         let turnThoughtSignature: string | undefined
+        let turnThinkingText = ''
+        let turnThinkingSignature: string | undefined
+
+        const flushThinkingSignatureCache = () => {
+          const sig = turnThinkingSignature || turnThoughtSignature
+          if (turnThinkingText && sig) {
+            this.cacheThinkingTextSignature(turnThinkingText, sig)
+          }
+          turnThinkingText = ''
+          turnThinkingSignature = undefined
+        }
 
         const sendSse = (event: string, data: Record<string, unknown>) => {
           const rawRes = res as unknown as {
@@ -496,6 +520,9 @@ export class AntigravityModule implements GatewayModule {
 
         const closeActiveBlock = () => {
           if (activeBlock !== 'none') {
+            if (activeBlock === 'thinking') {
+              flushThinkingSignatureCache()
+            }
             sendSse('content_block_stop', {
               type: 'content_block_stop',
               index: currentBlockIndex,
@@ -580,6 +607,10 @@ export class AntigravityModule implements GatewayModule {
                   })
                   activeBlock = 'thinking'
                 }
+                turnThinkingText += part.text
+                if (typeof part.thoughtSignature === 'string' && part.thoughtSignature) {
+                  turnThinkingSignature = part.thoughtSignature
+                }
                 estimatedOutputTokens += Math.max(1, Math.ceil(part.text.length / 3))
                 sendSse('content_block_delta', {
                   type: 'content_block_delta',
@@ -608,12 +639,21 @@ export class AntigravityModule implements GatewayModule {
               }
             }
 
-            // 2. 函数调用块 (Tool Use)，并缓存 Google thoughtSignature（优先取 part 自身，缺失时回退本轮前置 thought 签名）
-            if (part.functionCall && typeof part.functionCall === 'object') {
+            // 2. 函数调用块 (Tool Use)，优先保留上游 functionCall.id 并缓存 thoughtSignature
+            if (
+              part.functionCall &&
+              typeof part.functionCall === 'object' &&
+              typeof part.functionCall.name === 'string' &&
+              part.functionCall.name
+            ) {
               closeActiveBlock()
               stopReason = 'tool_use'
               currentBlockIndex++
-              const toolUseId = `toolu_${randomUUID().replace(/-/g, '').slice(0, 24)}`
+              const upstreamFcId =
+                typeof part.functionCall.id === 'string' && part.functionCall.id.trim()
+                  ? part.functionCall.id.trim()
+                  : ''
+              const toolUseId = upstreamFcId || `toolu_${randomUUID().replace(/-/g, '').slice(0, 24)}`
               const fcSig =
                 typeof part.thoughtSignature === 'string' && part.thoughtSignature
                   ? part.thoughtSignature
@@ -674,13 +714,19 @@ export class AntigravityModule implements GatewayModule {
           }
 
           // 兼容非 SSE JSON 数组流兜底
-          if (line.startsWith('{') || rawJsonFallback.length > 0) {
-            rawJsonFallback += line
+          if (line === '[' || line === ']') return
+          if (line.startsWith('{') || line.startsWith('[') || rawJsonFallback.length > 0) {
+            rawJsonFallback += line.replace(/^\[/, '')
             try {
-              const cleaned = rawJsonFallback.replace(/,\s*$/, '')
+              const cleaned = rawJsonFallback.replace(/^[,\s]+/, '').replace(/[,\]]\s*$/, '')
+              if (!cleaned) return
               const parsed = JSON.parse(cleaned)
               rawJsonFallback = ''
-              handleParsedFrame(parsed)
+              if (Array.isArray(parsed)) {
+                for (const frame of parsed) handleParsedFrame(frame)
+              } else {
+                handleParsedFrame(parsed)
+              }
             } catch {
               // 尚未形成完整 JSON 对象，等待后续行
             }
@@ -826,6 +872,8 @@ export class AntigravityModule implements GatewayModule {
         let stopReason: 'end_turn' | 'tool_use' | 'max_tokens' =
           candidate?.finishReason === 'MAX_TOKENS' ? 'max_tokens' : 'end_turn'
         let nonStreamTurnThoughtSig: string | undefined
+        let nonStreamThinkingText = ''
+        let nonStreamThinkingSig: string | undefined
 
         for (const part of parts) {
           if (!part || typeof part !== 'object') continue
@@ -834,6 +882,10 @@ export class AntigravityModule implements GatewayModule {
           }
           if (typeof part.text === 'string' && part.text) {
             if (part.thought === true) {
+              nonStreamThinkingText += part.text
+              if (typeof part.thoughtSignature === 'string' && part.thoughtSignature) {
+                nonStreamThinkingSig = part.thoughtSignature
+              }
               content.push({
                 type: 'thinking',
                 thinking: part.text,
@@ -842,9 +894,18 @@ export class AntigravityModule implements GatewayModule {
               content.push({ type: 'text', text: part.text })
             }
           }
-          if (part.functionCall && typeof part.functionCall === 'object') {
+          if (
+            part.functionCall &&
+            typeof part.functionCall === 'object' &&
+            typeof part.functionCall.name === 'string' &&
+            part.functionCall.name
+          ) {
             stopReason = 'tool_use'
-            const toolUseId = `toolu_${randomUUID().replace(/-/g, '').slice(0, 24)}`
+            const upstreamFcId =
+              typeof part.functionCall.id === 'string' && part.functionCall.id.trim()
+                ? part.functionCall.id.trim()
+                : ''
+            const toolUseId = upstreamFcId || `toolu_${randomUUID().replace(/-/g, '').slice(0, 24)}`
             const fcSig =
               typeof part.thoughtSignature === 'string' && part.thoughtSignature
                 ? part.thoughtSignature
@@ -859,6 +920,12 @@ export class AntigravityModule implements GatewayModule {
               input: part.functionCall.args ?? {},
             })
           }
+        }
+        if (nonStreamThinkingText && (nonStreamThinkingSig || nonStreamTurnThoughtSig)) {
+          this.cacheThinkingTextSignature(
+            nonStreamThinkingText,
+            (nonStreamThinkingSig || nonStreamTurnThoughtSig)!
+          )
         }
 
         if (content.length === 0) {

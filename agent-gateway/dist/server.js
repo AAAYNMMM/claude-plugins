@@ -10028,9 +10028,72 @@ import { join as join15 } from "node:path";
 import { homedir as homedir9 } from "node:os";
 
 // src/modules/antigravity/gemini-converter.ts
-function cleanSchemaForGemini(schema) {
+import { createHash as createHash5 } from "node:crypto";
+function hashThinkingText(text2) {
+  return createHash5("sha256").update(text2, "utf8").digest("hex");
+}
+function resolveLocalRef(ref, rootSchema) {
+  if (!ref.startsWith("#/")) return void 0;
+  const segments = ref.slice(2).split("/").map((s) => s.replace(/~1/g, "/").replace(/~0/g, "~"));
+  let cur = rootSchema;
+  for (const seg of segments) {
+    if (!cur || typeof cur !== "object" || Array.isArray(cur)) return void 0;
+    cur = cur[seg];
+  }
+  return cur && typeof cur === "object" && !Array.isArray(cur) ? cur : void 0;
+}
+function mergeAllOfSchemas(branches) {
+  const merged = {};
+  const mergedProps = {};
+  const mergedRequired = /* @__PURE__ */ new Set();
+  let hasProps = false;
+  for (const branch of branches) {
+    if (!branch || typeof branch !== "object" || Array.isArray(branch)) continue;
+    const b = branch;
+    if (b.type && !merged.type) merged.type = b.type;
+    if (typeof b.description === "string" && b.description && !merged.description) {
+      merged.description = b.description;
+    }
+    if (b.properties && typeof b.properties === "object" && !Array.isArray(b.properties)) {
+      hasProps = true;
+      Object.assign(mergedProps, b.properties);
+    }
+    if (Array.isArray(b.required)) {
+      for (const r of b.required) {
+        if (typeof r === "string") mergedRequired.add(r);
+      }
+    }
+    if (b.items && !merged.items) merged.items = b.items;
+    if (Array.isArray(b.enum) && !merged.enum) merged.enum = b.enum;
+  }
+  if (hasProps) merged.properties = mergedProps;
+  if (mergedRequired.size > 0) merged.required = Array.from(mergedRequired);
+  return merged;
+}
+function cleanSchemaForGemini(schema, rootSchema, visitedRefs) {
   if (!schema || typeof schema !== "object") {
     return { type: "object", properties: {} };
+  }
+  const root = rootSchema ?? schema;
+  if (typeof schema.$ref === "string" && schema.$ref.startsWith("#/")) {
+    const seen = visitedRefs ?? /* @__PURE__ */ new Set();
+    if (!seen.has(schema.$ref)) {
+      const target = resolveLocalRef(schema.$ref, root);
+      if (target) {
+        const nextSeen = new Set(seen);
+        nextSeen.add(schema.$ref);
+        const merged = {
+          ...target,
+          ...typeof schema.description === "string" && schema.description && !target.description ? { description: schema.description } : {}
+        };
+        return cleanSchemaForGemini(merged, root, nextSeen);
+      }
+    }
+  }
+  if (Array.isArray(schema.allOf) && schema.allOf.length > 0) {
+    const { allOf, ...rest } = schema;
+    const combined = mergeAllOfSchemas([rest, ...allOf]);
+    return cleanSchemaForGemini(combined, root, visitedRefs);
   }
   if (Array.isArray(schema.anyOf) || Array.isArray(schema.oneOf)) {
     const branches = schema.anyOf ?? schema.oneOf;
@@ -10040,7 +10103,7 @@ function cleanSchemaForGemini(schema) {
         ...nonNull,
         ...schema.description && !nonNull.description ? { description: schema.description } : {}
       };
-      return cleanSchemaForGemini(merged);
+      return cleanSchemaForGemini(merged, root, visitedRefs);
     }
   }
   const cleaned = {};
@@ -10067,7 +10130,7 @@ function cleanSchemaForGemini(schema) {
     const props = {};
     for (const [k, v] of Object.entries(schema.properties)) {
       if (k.startsWith("$")) continue;
-      props[k] = cleanSchemaForGemini(v);
+      props[k] = cleanSchemaForGemini(v, root, visitedRefs);
     }
     cleaned.properties = props;
   }
@@ -10080,9 +10143,11 @@ function cleanSchemaForGemini(schema) {
     }
   }
   if (Array.isArray(schema.items)) {
-    cleaned.items = schema.items.length > 0 ? cleanSchemaForGemini(schema.items[0]) : { type: "string" };
+    cleaned.items = schema.items.length > 0 ? cleanSchemaForGemini(schema.items[0], root, visitedRefs) : { type: "string" };
   } else if (schema.items) {
-    cleaned.items = cleanSchemaForGemini(schema.items);
+    cleaned.items = cleanSchemaForGemini(schema.items, root, visitedRefs);
+  } else if (cleaned.type === "array") {
+    cleaned.items = { type: "string" };
   }
   if (typeof schema.minimum === "number") {
     cleaned.minimum = schema.minimum;
@@ -10098,6 +10163,55 @@ function cleanSchemaForGemini(schema) {
     cleaned.type = "object";
   }
   return cleaned;
+}
+function convertMediaSourceToPart(source, defaultMime) {
+  if (!source || typeof source !== "object") return null;
+  if (source.type === "base64" && typeof source.data === "string" && source.data) {
+    return {
+      inlineData: {
+        mimeType: source.media_type || defaultMime,
+        data: source.data
+      }
+    };
+  }
+  if (source.type === "text" && typeof source.data === "string" && source.data) {
+    return { text: source.data };
+  }
+  if ((source.type === "url" || source.type === void 0) && typeof source.url === "string" && source.url) {
+    const dataMatch = source.url.match(/^data:([^;]+);base64,(.+)$/);
+    if (dataMatch) {
+      return {
+        inlineData: {
+          mimeType: dataMatch[1] || defaultMime,
+          data: dataMatch[2]
+        }
+      };
+    }
+    return {
+      fileData: {
+        mimeType: source.media_type || defaultMime,
+        fileUri: source.url
+      }
+    };
+  }
+  return null;
+}
+function resolveThinkingBudget(req) {
+  const thinking = req.thinking;
+  if (!thinking || typeof thinking !== "object") return void 0;
+  if (thinking.type === "disabled") return void 0;
+  if (typeof thinking.budget_tokens === "number" && thinking.budget_tokens > 0) {
+    return thinking.budget_tokens;
+  }
+  if (thinking.type === "adaptive" || thinking.type === "enabled") {
+    const effort = typeof req.output_config?.effort === "string" ? req.output_config.effort.toLowerCase() : "";
+    if (effort === "low") return 1024;
+    if (effort === "medium") return 4096;
+    if (effort === "high") return 8192;
+    if (effort === "max" || effort === "xhigh") return 16384;
+    return 4096;
+  }
+  return void 0;
 }
 function toGeminiRequest(req, options = {}) {
   const contents = [];
@@ -10123,30 +10237,53 @@ function toGeminiRequest(req, options = {}) {
   for (const msg of req.messages ?? []) {
     const role = msg.role === "assistant" ? "model" : "user";
     const parts = [];
+    let deferredToolParts = [];
+    const flushDeferredToolParts = () => {
+      if (deferredToolParts.length === 0) return;
+      parts.push(...deferredToolParts);
+      deferredToolParts = [];
+    };
     if (typeof msg.content === "string") {
       if (msg.content) parts.push({ text: msg.content });
     } else if (Array.isArray(msg.content)) {
       for (const part of msg.content) {
-        if (part.type === "text" && typeof part.text === "string") {
-          if (part.text) parts.push({ text: part.text });
-        } else if (part.type === "image" && part.source) {
-          const src = part.source;
-          if (src.type === "base64" && typeof src.data === "string" && src.data) {
-            parts.push({
-              inlineData: {
-                mimeType: src.media_type || "image/png",
-                data: src.data
-              }
-            });
+        if (!part || typeof part !== "object") continue;
+        if (part.type === "thinking") {
+          flushDeferredToolParts();
+          const thinkingText = typeof part.thinking === "string" ? part.thinking : "";
+          if (thinkingText) {
+            const cachedSig = options.thoughtSignatureByThinkingHash?.get(hashThinkingText(thinkingText));
+            const clientSig = options.allowClientThinkingSignature && typeof part.signature === "string" ? part.signature : "";
+            const sig = cachedSig || clientSig;
+            if (sig) {
+              parts.push({ thought: true, text: thinkingText, thoughtSignature: sig });
+            }
           }
+        } else if (part.type === "redacted_thinking") {
+          continue;
+        } else if (part.type === "text" && typeof part.text === "string") {
+          flushDeferredToolParts();
+          if (part.text) parts.push({ text: part.text });
+        } else if (part.type === "image") {
+          flushDeferredToolParts();
+          const mediaPart = convertMediaSourceToPart(part.source, "image/png");
+          if (mediaPart) parts.push(mediaPart);
+        } else if (part.type === "document") {
+          flushDeferredToolParts();
+          const docPart = convertMediaSourceToPart(part.source, "application/pdf");
+          if (docPart) parts.push(docPart);
         } else if (part.type === "tool_use") {
-          const toolId = typeof part.id === "string" ? part.id : "";
+          flushDeferredToolParts();
+          const toolId = typeof part.id === "string" ? part.id.trim() : "";
           const cachedSig = toolId ? options.thoughtSignatureByToolId?.get(toolId) : void 0;
           const sig = cachedSig || part.signature || options.fallbackThoughtSignature;
+          const rawInput = part.input;
+          const args = rawInput && typeof rawInput === "object" && !Array.isArray(rawInput) ? rawInput : {};
           const fcPart = {
             functionCall: {
-              name: part.name,
-              args: part.input ?? {}
+              ...toolId ? { id: toolId } : {},
+              name: typeof part.name === "string" ? part.name : "",
+              args
             }
           };
           if (typeof sig === "string" && sig) {
@@ -10154,11 +10291,11 @@ function toGeminiRequest(req, options = {}) {
           }
           parts.push(fcPart);
         } else if (part.type === "tool_result") {
-          const toolUseId = part.tool_use_id;
-          const functionName = toolIdToName.get(toolUseId) || "tool_result";
+          const toolUseId = typeof part.tool_use_id === "string" ? part.tool_use_id.trim() : "";
+          const functionName = toolUseId && toolIdToName.get(toolUseId) || "tool_result";
           let output = {};
           const c = part.content;
-          const nestedImages = [];
+          const nestedMedia = [];
           if (typeof c === "string") {
             try {
               const parsed = JSON.parse(c);
@@ -10172,13 +10309,20 @@ function toGeminiRequest(req, options = {}) {
               if (!item || typeof item !== "object") continue;
               if (item.type === "text" && typeof item.text === "string" && item.text) {
                 textParts.push(item.text);
-              } else if (item.type === "image" && item.source?.type === "base64" && item.source.data) {
-                nestedImages.push({
-                  inlineData: {
-                    mimeType: item.source.media_type || "image/png",
-                    data: item.source.data
-                  }
-                });
+              } else if (item.type === "image") {
+                const mediaPart = convertMediaSourceToPart(item.source, "image/png");
+                if (mediaPart) nestedMedia.push(mediaPart);
+              } else if (item.type === "document") {
+                const docPart = convertMediaSourceToPart(item.source, "application/pdf");
+                if (docPart) {
+                  if (docPart.text) textParts.push(docPart.text);
+                  else nestedMedia.push(docPart);
+                }
+              } else {
+                try {
+                  textParts.push(JSON.stringify(item));
+                } catch {
+                }
               }
             }
             output = { result: textParts.join("\n") };
@@ -10192,15 +10336,17 @@ function toGeminiRequest(req, options = {}) {
           }
           parts.push({
             functionResponse: {
+              ...toolUseId ? { id: toolUseId } : {},
               name: functionName,
               response: output
             }
           });
-          for (const imgPart of nestedImages) {
-            parts.push(imgPart);
+          if (nestedMedia.length > 0) {
+            deferredToolParts.push(...nestedMedia);
           }
         }
       }
+      flushDeferredToolParts();
     }
     if (parts.length > 0) {
       const last = contents[contents.length - 1];
@@ -10214,12 +10360,18 @@ function toGeminiRequest(req, options = {}) {
   const generationConfig = {};
   if (typeof req.temperature === "number") generationConfig.temperature = req.temperature;
   if (typeof req.max_tokens === "number") generationConfig.maxOutputTokens = req.max_tokens;
-  if (req.thinking && req.thinking.budget_tokens) {
-    generationConfig.thinkingConfig = {
-      thinkingBudget: req.thinking.budget_tokens
-    };
+  if (typeof req.top_p === "number") generationConfig.topP = req.top_p;
+  if (typeof req.top_k === "number") generationConfig.topK = req.top_k;
+  if (Array.isArray(req.stop_sequences) && req.stop_sequences.length > 0) {
+    const stops = req.stop_sequences.filter((s) => typeof s === "string" && s.length > 0);
+    if (stops.length > 0) generationConfig.stopSequences = stops;
+  }
+  const thinkingBudget = resolveThinkingBudget(req);
+  if (thinkingBudget !== void 0) {
+    generationConfig.thinkingConfig = { thinkingBudget };
   }
   let tools = void 0;
+  let toolConfig = void 0;
   if (req.tools && req.tools.length > 0) {
     const uniqueTools = [];
     const seenToolNames = /* @__PURE__ */ new Set();
@@ -10235,13 +10387,31 @@ function toGeminiRequest(req, options = {}) {
     }));
     if (functionDeclarations.length > 0) {
       tools = [{ functionDeclarations }];
+      const choice = req.tool_choice;
+      if (choice && typeof choice === "object") {
+        if (choice.type === "auto") {
+          toolConfig = { functionCallingConfig: { mode: "AUTO" } };
+        } else if (choice.type === "any") {
+          toolConfig = { functionCallingConfig: { mode: "ANY" } };
+        } else if (choice.type === "none") {
+          toolConfig = { functionCallingConfig: { mode: "NONE" } };
+        } else if (choice.type === "tool" && typeof choice.name === "string" && choice.name) {
+          toolConfig = {
+            functionCallingConfig: {
+              mode: "ANY",
+              allowedFunctionNames: [choice.name]
+            }
+          };
+        }
+      }
     }
   }
   return {
     contents,
     ...systemInstruction ? { systemInstruction } : {},
     ...Object.keys(generationConfig).length > 0 ? { generationConfig } : {},
-    ...tools ? { tools } : {}
+    ...tools ? { tools } : {},
+    ...toolConfig ? { toolConfig } : {}
   };
 }
 
@@ -10508,13 +10678,21 @@ var AntigravityModule = class {
   nextDispatchAt = 0;
   bucketRateLimitUntil = /* @__PURE__ */ new Map();
   toolThoughtSignatures = /* @__PURE__ */ new Map();
-  cacheThoughtSignature(toolUseId, signature) {
-    if (!toolUseId || !signature) return;
-    if (this.toolThoughtSignatures.size >= MAX_THOUGHT_SIG_CACHE) {
-      const oldestKey = this.toolThoughtSignatures.keys().next().value;
-      if (oldestKey) this.toolThoughtSignatures.delete(oldestKey);
+  thoughtTextSignatures = /* @__PURE__ */ new Map();
+  setBoundedCache(cache2, key, value) {
+    if (!key || !value) return;
+    if (cache2.size >= MAX_THOUGHT_SIG_CACHE) {
+      const oldestKey = cache2.keys().next().value;
+      if (oldestKey) cache2.delete(oldestKey);
     }
-    this.toolThoughtSignatures.set(toolUseId, signature);
+    cache2.set(key, value);
+  }
+  cacheThoughtSignature(toolUseId, signature) {
+    this.setBoundedCache(this.toolThoughtSignatures, toolUseId, signature);
+  }
+  cacheThinkingTextSignature(thinkingText, signature) {
+    if (!thinkingText || !signature) return;
+    this.setBoundedCache(this.thoughtTextSignatures, hashThinkingText(thinkingText), signature);
   }
   async acquireSlot(signal) {
     while (this.inFlight >= MAX_CONCURRENT_REQUESTS) {
@@ -10603,9 +10781,12 @@ var AntigravityModule = class {
     const upstreamModel = resolveUpstreamModel(rawModel);
     const bucket = getQuotaBucket(upstreamModel);
     const { projectId } = await fetchLiveProjectAndTier(accessToken);
+    const isGeminiModel = upstreamModel.toLowerCase().includes("gemini");
     const geminiBody = toGeminiRequest(request, {
       thoughtSignatureByToolId: this.toolThoughtSignatures,
-      fallbackThoughtSignature: upstreamModel.toLowerCase().includes("gemini") ? "skip_thought_signature_validator" : void 0
+      thoughtSignatureByThinkingHash: this.thoughtTextSignatures,
+      allowClientThinkingSignature: !isGeminiModel,
+      fallbackThoughtSignature: isGeminiModel ? "skip_thought_signature_validator" : void 0
     });
     const maxAllowedOut = getModelMaxOutputTokens(upstreamModel);
     if (maxAllowedOut && geminiBody.generationConfig?.maxOutputTokens && geminiBody.generationConfig.maxOutputTokens > maxAllowedOut) {
@@ -10767,6 +10948,16 @@ var AntigravityModule = class {
         let firstStreamError = null;
         let postStartStreamError = null;
         let turnThoughtSignature;
+        let turnThinkingText = "";
+        let turnThinkingSignature;
+        const flushThinkingSignatureCache = () => {
+          const sig = turnThinkingSignature || turnThoughtSignature;
+          if (turnThinkingText && sig) {
+            this.cacheThinkingTextSignature(turnThinkingText, sig);
+          }
+          turnThinkingText = "";
+          turnThinkingSignature = void 0;
+        };
         const sendSse = (event, data) => {
           const rawRes = res;
           if (rawRes.writableEnded || rawRes.destroyed || rawRes.writable === false) return;
@@ -10799,6 +10990,9 @@ data: ${JSON.stringify(data)}
         };
         const closeActiveBlock = () => {
           if (activeBlock !== "none") {
+            if (activeBlock === "thinking") {
+              flushThinkingSignatureCache();
+            }
             sendSse("content_block_stop", {
               type: "content_block_stop",
               index: currentBlockIndex
@@ -10869,6 +11063,10 @@ data: ${JSON.stringify(data)}
                   });
                   activeBlock = "thinking";
                 }
+                turnThinkingText += part.text;
+                if (typeof part.thoughtSignature === "string" && part.thoughtSignature) {
+                  turnThinkingSignature = part.thoughtSignature;
+                }
                 estimatedOutputTokens += Math.max(1, Math.ceil(part.text.length / 3));
                 sendSse("content_block_delta", {
                   type: "content_block_delta",
@@ -10896,11 +11094,12 @@ data: ${JSON.stringify(data)}
                 emittedVisibleOrTool = true;
               }
             }
-            if (part.functionCall && typeof part.functionCall === "object") {
+            if (part.functionCall && typeof part.functionCall === "object" && typeof part.functionCall.name === "string" && part.functionCall.name) {
               closeActiveBlock();
               stopReason = "tool_use";
               currentBlockIndex++;
-              const toolUseId = `toolu_${randomUUID3().replace(/-/g, "").slice(0, 24)}`;
+              const upstreamFcId = typeof part.functionCall.id === "string" && part.functionCall.id.trim() ? part.functionCall.id.trim() : "";
+              const toolUseId = upstreamFcId || `toolu_${randomUUID3().replace(/-/g, "").slice(0, 24)}`;
               const fcSig = typeof part.thoughtSignature === "string" && part.thoughtSignature ? part.thoughtSignature : turnThoughtSignature;
               if (fcSig) {
                 this.cacheThoughtSignature(toolUseId, fcSig);
@@ -10950,13 +11149,19 @@ data: ${JSON.stringify(data)}
             }
             return;
           }
-          if (line.startsWith("{") || rawJsonFallback.length > 0) {
-            rawJsonFallback += line;
+          if (line === "[" || line === "]") return;
+          if (line.startsWith("{") || line.startsWith("[") || rawJsonFallback.length > 0) {
+            rawJsonFallback += line.replace(/^\[/, "");
             try {
-              const cleaned = rawJsonFallback.replace(/,\s*$/, "");
+              const cleaned = rawJsonFallback.replace(/^[,\s]+/, "").replace(/[,\]]\s*$/, "");
+              if (!cleaned) return;
               const parsed = JSON.parse(cleaned);
               rawJsonFallback = "";
-              handleParsedFrame(parsed);
+              if (Array.isArray(parsed)) {
+                for (const frame of parsed) handleParsedFrame(frame);
+              } else {
+                handleParsedFrame(parsed);
+              }
             } catch {
             }
           }
@@ -11090,6 +11295,8 @@ data: ${JSON.stringify(data)}
         const content = [];
         let stopReason = candidate?.finishReason === "MAX_TOKENS" ? "max_tokens" : "end_turn";
         let nonStreamTurnThoughtSig;
+        let nonStreamThinkingText = "";
+        let nonStreamThinkingSig;
         for (const part of parts) {
           if (!part || typeof part !== "object") continue;
           if (typeof part.thoughtSignature === "string" && part.thoughtSignature) {
@@ -11097,6 +11304,10 @@ data: ${JSON.stringify(data)}
           }
           if (typeof part.text === "string" && part.text) {
             if (part.thought === true) {
+              nonStreamThinkingText += part.text;
+              if (typeof part.thoughtSignature === "string" && part.thoughtSignature) {
+                nonStreamThinkingSig = part.thoughtSignature;
+              }
               content.push({
                 type: "thinking",
                 thinking: part.text
@@ -11105,9 +11316,10 @@ data: ${JSON.stringify(data)}
               content.push({ type: "text", text: part.text });
             }
           }
-          if (part.functionCall && typeof part.functionCall === "object") {
+          if (part.functionCall && typeof part.functionCall === "object" && typeof part.functionCall.name === "string" && part.functionCall.name) {
             stopReason = "tool_use";
-            const toolUseId = `toolu_${randomUUID3().replace(/-/g, "").slice(0, 24)}`;
+            const upstreamFcId = typeof part.functionCall.id === "string" && part.functionCall.id.trim() ? part.functionCall.id.trim() : "";
+            const toolUseId = upstreamFcId || `toolu_${randomUUID3().replace(/-/g, "").slice(0, 24)}`;
             const fcSig = typeof part.thoughtSignature === "string" && part.thoughtSignature ? part.thoughtSignature : nonStreamTurnThoughtSig;
             if (fcSig) {
               this.cacheThoughtSignature(toolUseId, fcSig);
@@ -11119,6 +11331,12 @@ data: ${JSON.stringify(data)}
               input: part.functionCall.args ?? {}
             });
           }
+        }
+        if (nonStreamThinkingText && (nonStreamThinkingSig || nonStreamTurnThoughtSig)) {
+          this.cacheThinkingTextSignature(
+            nonStreamThinkingText,
+            nonStreamThinkingSig || nonStreamTurnThoughtSig
+          );
         }
         if (content.length === 0) {
           const reason = resp.promptFeedback?.blockReason || candidate?.finishReason || "EMPTY_RESPONSE";
